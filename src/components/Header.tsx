@@ -3,13 +3,15 @@
 import Image from "next/image";
 import { ExternalLink } from "lucide-react";
 
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH || "";
+
 export function Header() {
   return (
     <header className="sticky top-0 z-30 border-b border-white/10 bg-[#0D0E12]/90 backdrop-blur-md">
       <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3 sm:px-6">
         <div className="flex items-center gap-2.5">
           <Image
-            src="/lxg-logo.png"
+            src={`${basePath}/lxg-logo.png`}
             alt="LXG"
             width={28}
             height={28}
