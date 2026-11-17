@@ -1,8 +1,11 @@
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
+import { buildFFmpegVideoChain } from "@/lib/video-effects";
 import type {
   AspectMode,
   BeatCutSegment,
   SourceClipItem,
+  VideoCropRect,
+  VideoFilterConfig,
 } from "@/types/renderer";
 
 interface FFmpegProgressEvent {
@@ -288,6 +291,8 @@ export interface RenderHookJobParams {
   outputFilename: string;
   aspectMode: AspectMode;
   muteAudio: boolean;
+  videoFilter?: VideoFilterConfig;
+  videoCrop?: VideoCropRect;
   onProgress?: (ratio: number) => void;
 }
 
@@ -299,7 +304,9 @@ export async function prepareSingleLoopBase(
   sourceFile: File,
   aspectMode: AspectMode,
   muteAudio: boolean,
-  onProgress?: (ratio: number) => void
+  onProgress?: (ratio: number) => void,
+  videoFilter?: VideoFilterConfig,
+  videoCrop?: VideoCropRect
 ): Promise<void> {
   const inputFileName = "input_source.mp4";
   const baseName = "loop_base.mp4";
@@ -308,10 +315,11 @@ export async function prepareSingleLoopBase(
   ]);
   const inputPath = mounted.paths.get(inputFileName) ?? inputFileName;
 
-  const vf =
-    aspectMode === "force-9x16"
-      ? "scale=1080:1920:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=1080:1920,setsar=1"
-      : "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=fast_bilinear,setsar=1";
+  const vf = buildFFmpegVideoChain({
+    aspectMode,
+    crop: videoCrop,
+    filter: videoFilter,
+  });
 
   const progressHandler = createThrottledProgress(onProgress);
   if (progressHandler) {
@@ -423,6 +431,8 @@ export async function renderSingleHookVideo({
   outputFilename,
   aspectMode,
   muteAudio,
+  videoFilter,
+  videoCrop,
   onProgress,
 }: RenderHookJobParams): Promise<Blob> {
   const inputFileName = "input_source.mp4";
@@ -445,10 +455,12 @@ export async function renderSingleHookVideo({
   }
 
   try {
-    const filterComplex =
-      aspectMode === "force-9x16"
-        ? "[0:v]scale=1080:1920:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=1080:1920,setsar=1[bg];[bg][1:v]overlay=0:0:format=auto[v]"
-        : "[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=fast_bilinear[bg];[bg][1:v]overlay=0:0:format=auto[v]";
+    const bgChain = buildFFmpegVideoChain({
+      aspectMode,
+      crop: videoCrop,
+      filter: videoFilter,
+    });
+    const filterComplex = `[0:v]${bgChain}[bg];[bg][1:v]overlay=0:0:format=auto[v]`;
 
     const args = [
       "-i",
@@ -580,7 +592,9 @@ async function renderCutSegments(
   clips: SourceClipItem[],
   clipFileMap: Map<string, string>,
   aspectMode: AspectMode,
-  onSegmentProgress?: (completed: number, total: number) => void
+  onSegmentProgress?: (completed: number, total: number) => void,
+  videoFilter?: VideoFilterConfig,
+  videoCrop?: VideoCropRect
 ): Promise<string[]> {
   if (segments.length === 0) {
     throw new Error("No valid beat segments to render in the selected window.");
@@ -589,10 +603,14 @@ async function renderCutSegments(
   const clipDurationMap = new Map(clips.map((c) => [c.id, c.duration]));
   const segNames: string[] = [];
 
-  const vfFilter =
-    aspectMode === "force-9x16"
-      ? `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=${width}:${height},setsar=1,fps=30`
-      : `scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30`;
+  const vfFilter = buildFFmpegVideoChain({
+    aspectMode,
+    targetWidth: width,
+    targetHeight: height,
+    crop: videoCrop,
+    filter: videoFilter,
+    fps: 30,
+  });
 
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
@@ -685,6 +703,8 @@ export interface BeatSyncSharedBaseParams {
   windowStart: number;
   windowEnd: number;
   aspectMode: AspectMode;
+  videoFilter?: VideoFilterConfig;
+  videoCrop?: VideoCropRect;
   onProgress?: (ratio: number) => void;
 }
 
@@ -697,6 +717,8 @@ export async function buildBeatSyncedBaseVideo({
   windowStart,
   windowEnd,
   aspectMode,
+  videoFilter,
+  videoCrop,
   onProgress,
 }: BeatSyncSharedBaseParams): Promise<void> {
   const totalDuration = Math.max(0.5, windowEnd - windowStart);
@@ -706,7 +728,9 @@ export async function buildBeatSyncedBaseVideo({
     clips,
     clipFileMap,
     aspectMode,
-    (done, total) => onProgress?.((done / total) * 0.8)
+    (done, total) => onProgress?.((done / total) * 0.8),
+    videoFilter,
+    videoCrop
   );
 
   const concatText = segNames.map((n) => `file '${n}'`).join("\n");
@@ -833,6 +857,8 @@ export interface RenderSingleBeatSyncedReelParams {
   overlayPngBytes: Uint8Array;
   outputFilename: string;
   aspectMode: AspectMode;
+  videoFilter?: VideoFilterConfig;
+  videoCrop?: VideoCropRect;
   onProgress?: (ratio: number) => void;
 }
 
@@ -847,6 +873,8 @@ export async function renderSingleBeatSyncedReel({
   overlayPngBytes,
   outputFilename,
   aspectMode,
+  videoFilter,
+  videoCrop,
   onProgress,
 }: RenderSingleBeatSyncedReelParams): Promise<Blob> {
   const totalDuration = Math.max(0.5, windowEnd - windowStart);
@@ -856,7 +884,9 @@ export async function renderSingleBeatSyncedReel({
     clips,
     clipFileMap,
     aspectMode,
-    (done, total) => onProgress?.((done / total) * 0.65)
+    (done, total) => onProgress?.((done / total) * 0.65),
+    videoFilter,
+    videoCrop
   );
 
   const concatText = segNames.map((n) => `file '${n}'`).join("\n");

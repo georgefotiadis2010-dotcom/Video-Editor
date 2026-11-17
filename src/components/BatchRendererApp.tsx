@@ -24,6 +24,11 @@ import {
 import { BeatSyncEditor } from "@/components/BeatSyncEditor";
 import { Header } from "@/components/Header";
 import { HookPreviewStage } from "@/components/HookPreviewStage";
+import { VideoEffectsPanel } from "@/components/VideoEffectsPanel";
+import {
+  DEFAULT_VIDEO_CROP,
+  DEFAULT_VIDEO_FILTER,
+} from "@/lib/video-effects";
 import {
   cleanupSourceFile,
   formatFFmpegError,
@@ -49,6 +54,8 @@ import type {
   RenderedClip,
   RenderPhase,
   TextStyleConfig,
+  VideoCropRect,
+  VideoFilterConfig,
   VideoMetadata,
 } from "@/types/renderer";
 
@@ -96,6 +103,10 @@ export function BatchRendererApp() {
 
   const [styleConfig, setStyleConfig] =
     useState<TextStyleConfig>(DEFAULT_TEXT_STYLE);
+  const [videoFilter, setVideoFilter] =
+    useState<VideoFilterConfig>(DEFAULT_VIDEO_FILTER);
+  const [videoCrop, setVideoCrop] =
+    useState<VideoCropRect>(DEFAULT_VIDEO_CROP);
   const [aspectMode, setAspectMode] = useState<AspectMode>("force-9x16");
   const [muteAudio, setMuteAudio] = useState(false);
   const [autoDownloadEach, setAutoDownloadEach] = useState(false);
@@ -281,7 +292,9 @@ export function BatchRendererApp() {
             video.file,
             aspectMode,
             muteAudio,
-            (ratio) => setCurrentClipProgress(ratio)
+            (ratio) => setCurrentClipProgress(ratio),
+            videoFilter,
+            videoCrop
           );
           setIsPreparingBase(false);
         }
@@ -329,6 +342,8 @@ export function BatchRendererApp() {
                 outputFilename: filename,
                 aspectMode,
                 muteAudio,
+                videoFilter,
+                videoCrop,
                 onProgress: (ratio) => setCurrentClipProgress(ratio),
               });
 
@@ -1067,6 +1082,14 @@ export function BatchRendererApp() {
                   <span>ALL CAPS</span>
                 </label>
               </div>
+
+              <VideoEffectsPanel
+                videoFilter={videoFilter}
+                onChangeFilter={setVideoFilter}
+                videoCrop={videoCrop}
+                onChangeCrop={setVideoCrop}
+                disabled={isBusy}
+              />
             </section>
           </div>
 
@@ -1080,6 +1103,9 @@ export function BatchRendererApp() {
               styleConfig={styleConfig}
               aspectMode={aspectMode}
               muteAudio={muteAudio}
+              videoFilter={videoFilter}
+              videoCrop={videoCrop}
+              onChangeCrop={setVideoCrop}
             />
 
             {/* Render Action Card */}

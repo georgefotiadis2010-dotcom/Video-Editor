@@ -23,7 +23,12 @@ import {
   Zap,
 } from "lucide-react";
 import { HookPreviewStage } from "@/components/HookPreviewStage";
+import { VideoEffectsPanel } from "@/components/VideoEffectsPanel";
 import { WaveformBeatEditor } from "@/components/WaveformBeatEditor";
+import {
+  DEFAULT_VIDEO_CROP,
+  DEFAULT_VIDEO_FILTER,
+} from "@/lib/video-effects";
 import {
   analyzeAudioFile,
   rescaleAnalysisBpm,
@@ -59,6 +64,8 @@ import type {
   RenderPhase,
   SourceClipItem,
   TextStyleConfig,
+  VideoCropRect,
+  VideoFilterConfig,
 } from "@/types/renderer";
 
 function formatBytes(bytes: number): string {
@@ -182,6 +189,10 @@ export function BeatSyncEditor() {
   const [activeHookIndex, setActiveHookIndex] = useState(0);
   const [styleConfig, setStyleConfig] =
     useState<TextStyleConfig>(DEFAULT_TEXT_STYLE);
+  const [videoFilter, setVideoFilter] =
+    useState<VideoFilterConfig>(DEFAULT_VIDEO_FILTER);
+  const [videoCrop, setVideoCrop] =
+    useState<VideoCropRect>(DEFAULT_VIDEO_CROP);
   const [aspectMode, setAspectMode] = useState<AspectMode>("force-9x16");
   const [arrangementMode, setArrangementMode] =
     useState<ClipArrangementMode>("shuffle-per-hook");
@@ -512,6 +523,8 @@ export function BeatSyncEditor() {
             windowStart,
             windowEnd,
             aspectMode,
+            videoFilter,
+            videoCrop,
             onProgress: (ratio) => setCurrentClipProgress(ratio),
           });
         }
@@ -575,6 +588,8 @@ export function BeatSyncEditor() {
               overlayPngBytes,
               outputFilename: filename,
               aspectMode,
+              videoFilter,
+              videoCrop,
               onProgress: (ratio) => setCurrentClipProgress(ratio),
             });
           }
@@ -1505,6 +1520,14 @@ export function BeatSyncEditor() {
                     <span>Auto-download each</span>
                   </label>
                 </div>
+
+                <VideoEffectsPanel
+                  videoFilter={videoFilter}
+                  onChangeFilter={setVideoFilter}
+                  videoCrop={videoCrop}
+                  onChangeCrop={setVideoCrop}
+                  disabled={isBusy}
+                />
               </div>
             )}
           </section>
@@ -1521,6 +1544,9 @@ export function BeatSyncEditor() {
             aspectMode={aspectMode}
             muteAudio={true}
             beatSyncPreview={beatSyncPreview}
+            videoFilter={videoFilter}
+            videoCrop={videoCrop}
+            onChangeCrop={setVideoCrop}
           />
 
           {/* Render Action Card */}

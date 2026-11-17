@@ -2,20 +2,30 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Check,
   ChevronLeft,
   ChevronRight,
+  Crop,
   Eye,
   EyeOff,
   Film,
   Pause,
   Play,
+  RotateCcw,
 } from "lucide-react";
 import { drawHookOnCanvas } from "@/lib/text-overlay";
+import {
+  buildPreviewCssFilter,
+  DEFAULT_VIDEO_CROP,
+  isCropActive,
+} from "@/lib/video-effects";
 import type {
   AspectMode,
   BeatCutSegment,
   SourceClipItem,
   TextStyleConfig,
+  VideoCropRect,
+  VideoFilterConfig,
   VideoMetadata,
 } from "@/types/renderer";
 
@@ -36,6 +46,9 @@ interface HookPreviewStageProps {
   aspectMode: AspectMode;
   muteAudio: boolean;
   beatSyncPreview?: BeatSyncPreviewData | null;
+  videoFilter?: VideoFilterConfig;
+  videoCrop?: VideoCropRect;
+  onChangeCrop?: (next: VideoCropRect) => void;
 }
 
 export function HookPreviewStage({
@@ -47,20 +60,34 @@ export function HookPreviewStage({
   aspectMode,
   muteAudio,
   beatSyncPreview,
+  videoFilter,
+  videoCrop,
+  onChangeCrop,
 }: HookPreviewStageProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const poolVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const activeSegIdxRef = useRef<number>(-1);
+  const cropDragRef = useRef<{
+    handle: "move" | "nw" | "ne" | "sw" | "se";
+    startX: number;
+    startY: number;
+    orig: VideoCropRect;
+  } | null>(null);
 
   const [showSafeZone, setShowSafeZone] = useState(true);
+  const [isCropping, setIsCropping] = useState(false);
   const [isBeatPlaying, setIsBeatPlaying] = useState(false);
   const [activePreviewClipId, setActivePreviewClipId] = useState<string | null>(
     null
   );
   const [activeSegLabel, setActiveSegLabel] = useState<string | null>(null);
   const [videoDecodeError, setVideoDecodeError] = useState<string | null>(null);
+
+  const activeCrop = videoCrop ?? DEFAULT_VIDEO_CROP;
+  const cropEnabled = isCropActive(activeCrop);
 
   const canBeatPreview = Boolean(
     beatSyncPreview &&
@@ -272,6 +299,94 @@ export function HookPreviewStage({
   const fitClass = aspectMode === "force-9x16" ? "object-cover" : "object-contain";
   const displayVideoUrl = video?.url ?? null;
 
+  const cssFilter = buildPreviewCssFilter(videoFilter);
+
+  // Compute uniform crop preview transform when not actively editing the crop box
+  const cropTransformStyle = useMemo<React.CSSProperties | undefined>(() => {
+    if (isCropping || !cropEnabled) return undefined;
+    const scale =
+      aspectMode === "force-9x16"
+        ? Math.max(1 / activeCrop.width, 1 / activeCrop.height)
+        : Math.min(1 / activeCrop.width, 1 / activeCrop.height);
+    const cx = activeCrop.x + activeCrop.width / 2;
+    const cy = activeCrop.y + activeCrop.height / 2;
+    const txPct = 50 / scale - cx * 100;
+    const tyPct = 50 / scale - cy * 100;
+    return {
+      transformOrigin: "0 0",
+      transform: `scale(${scale.toFixed(4)}) translate(${txPct.toFixed(3)}%, ${tyPct.toFixed(3)}%)`,
+    };
+  }, [isCropping, cropEnabled, activeCrop, aspectMode]);
+
+  const startCropDrag = (
+    e: React.PointerEvent<HTMLElement>,
+    handle: "move" | "nw" | "ne" | "sw" | "se"
+  ) => {
+    if (!onChangeCrop) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    cropDragRef.current = {
+      handle,
+      startX: e.clientX,
+      startY: e.clientY,
+      orig: { ...activeCrop },
+    };
+  };
+
+  const handleCropPointerMove = (e: React.PointerEvent<HTMLElement>) => {
+    const drag = cropDragRef.current;
+    const stage = stageRef.current;
+    if (!drag || !stage || !onChangeCrop) return;
+    const rect = stage.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const dx = (e.clientX - drag.startX) / rect.width;
+    const dy = (e.clientY - drag.startY) / rect.height;
+    const minSize = 0.15;
+    const { orig, handle } = drag;
+
+    let x = orig.x;
+    let y = orig.y;
+    let w = orig.width;
+    let h = orig.height;
+
+    if (handle === "move") {
+      x = Math.max(0, Math.min(1 - w, orig.x + dx));
+      y = Math.max(0, Math.min(1 - h, orig.y + dy));
+    } else {
+      if (handle === "nw" || handle === "sw") {
+        const right = orig.x + orig.width;
+        const nextX = Math.max(0, Math.min(right - minSize, orig.x + dx));
+        w = right - nextX;
+        x = nextX;
+      }
+      if (handle === "ne" || handle === "se") {
+        w = Math.max(minSize, Math.min(1 - orig.x, orig.width + dx));
+      }
+      if (handle === "nw" || handle === "ne") {
+        const bottom = orig.y + orig.height;
+        const nextY = Math.max(0, Math.min(bottom - minSize, orig.y + dy));
+        h = bottom - nextY;
+        y = nextY;
+      }
+      if (handle === "sw" || handle === "se") {
+        h = Math.max(minSize, Math.min(1 - orig.y, orig.height + dy));
+      }
+    }
+
+    onChangeCrop({
+      x: Number(x.toFixed(4)),
+      y: Number(y.toFixed(4)),
+      width: Number(w.toFixed(4)),
+      height: Number(h.toFixed(4)),
+    });
+  };
+
+  const endCropDrag = () => {
+    cropDragRef.current = null;
+  };
+
   return (
     <div className="nb-module flex flex-col gap-3 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -305,6 +420,34 @@ export function HookPreviewStage({
             </button>
           )}
 
+          {onChangeCrop && (
+            <button
+              type="button"
+              disabled={!displayVideoUrl && !canBeatPreview}
+              onClick={() => setIsCropping((prev) => !prev)}
+              className={`nb-key inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider ${
+                isCropping
+                  ? "nb-key-primary"
+                  : cropEnabled
+                    ? "nb-key-active"
+                    : ""
+              }`}
+              title="Drag corners to crop video frame"
+            >
+              {isCropping ? (
+                <>
+                  <Check className="h-3 w-3" />
+                  <span>Done Crop</span>
+                </>
+              ) : (
+                <>
+                  <Crop className="h-3 w-3" />
+                  <span>{cropEnabled ? "Cropped" : "Crop"}</span>
+                </>
+              )}
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => setShowSafeZone((prev) => !prev)}
@@ -326,79 +469,120 @@ export function HookPreviewStage({
       {/* Phone Stage */}
       <div className="flex justify-center">
         <div
-          className="relative w-full max-w-[260px] overflow-hidden rounded-2xl border border-white/10 bg-black"
+          ref={stageRef}
+          className="relative w-full max-w-[260px] overflow-hidden rounded-2xl border border-white/10 bg-black select-none"
           style={{ aspectRatio: aspectRatioCss }}
         >
-          {effectiveBeatPlaying && beatSyncPreview ? (
-            <div className="relative h-full w-full">
-              {beatSyncPreview.clips.map((clip) => {
-                const isActive =
-                  activePreviewClipId === clip.id ||
-                  (!activePreviewClipId &&
-                    clip.id === beatSyncPreview.segments[0]?.clipId);
-                return (
-                  <video
-                    key={clip.id}
-                    ref={(el) => {
-                      if (el) {
-                        poolVideoRefs.current.set(clip.id, el);
-                      } else {
-                        poolVideoRefs.current.delete(clip.id);
-                      }
-                    }}
-                    src={clip.url}
-                    muted
-                    playsInline
-                    preload="auto"
-                    className={`absolute inset-0 h-full w-full ${fitClass} transition-opacity duration-75 ${
-                      isActive ? "z-[1] opacity-100" : "z-0 opacity-0 pointer-events-none"
-                    }`}
-                  />
-                );
-              })}
-            </div>
-          ) : displayVideoUrl ? (
-            <>
-              <video
-                ref={videoRef}
-                key={displayVideoUrl}
-                src={displayVideoUrl}
-                autoPlay
-                loop
-                muted={muteAudio}
-                playsInline
-                preload="auto"
-                onLoadedData={(e) => {
-                  const vid = e.currentTarget;
-                  vid.play().catch(() => {
-                    // Browser blocked unmuted autoplay; fall back to muted preview
-                    vid.muted = true;
-                    vid.play().catch(() => {});
-                  });
-                }}
-                onError={() => {
-                  setVideoDecodeError(
-                    "Browser cannot preview this video codec directly — FFmpeg can still render it."
+          {/* Video + Color Grade Layer */}
+          <div
+            className="relative h-full w-full"
+            style={{
+              ...cropTransformStyle,
+              filter: cssFilter,
+            }}
+          >
+            {effectiveBeatPlaying && beatSyncPreview ? (
+              <div className="relative h-full w-full">
+                {beatSyncPreview.clips.map((clip) => {
+                  const isActive =
+                    activePreviewClipId === clip.id ||
+                    (!activePreviewClipId &&
+                      clip.id === beatSyncPreview.segments[0]?.clipId);
+                  return (
+                    <video
+                      key={clip.id}
+                      ref={(el) => {
+                        if (el) {
+                          poolVideoRefs.current.set(clip.id, el);
+                        } else {
+                          poolVideoRefs.current.delete(clip.id);
+                        }
+                      }}
+                      src={clip.url}
+                      muted
+                      playsInline
+                      preload="auto"
+                      className={`absolute inset-0 h-full w-full ${fitClass} transition-opacity duration-75 ${
+                        isActive ? "z-[1] opacity-100" : "z-0 opacity-0 pointer-events-none"
+                      }`}
+                    />
                   );
-                }}
-                className={`h-full w-full ${fitClass}`}
-              />
-              {videoDecodeError && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/85 p-5 text-center">
-                  <Film className="h-5 w-5 text-[#FF4D2E]" />
-                  <p className="font-mono text-[10px] leading-relaxed text-[#C4C7D0]">
-                    {videoDecodeError}
-                  </p>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-6 text-center">
-              <Film className="h-5 w-5 text-[#555966]" />
-              <p className="font-mono text-[11px] text-[#8B8F9C]">
-                No video loaded
-              </p>
-            </div>
+                })}
+              </div>
+            ) : displayVideoUrl ? (
+              <>
+                <video
+                  ref={videoRef}
+                  key={displayVideoUrl}
+                  src={displayVideoUrl}
+                  autoPlay
+                  loop
+                  muted={muteAudio}
+                  playsInline
+                  preload="auto"
+                  onLoadedData={(e) => {
+                    const vid = e.currentTarget;
+                    vid.play().catch(() => {
+                      // Browser blocked unmuted autoplay; fall back to muted preview
+                      vid.muted = true;
+                      vid.play().catch(() => {});
+                    });
+                  }}
+                  onError={() => {
+                    setVideoDecodeError(
+                      "Browser cannot preview this video codec directly — FFmpeg can still render it."
+                    );
+                  }}
+                  className={`h-full w-full ${fitClass}`}
+                />
+                {videoDecodeError && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/85 p-5 text-center">
+                    <Film className="h-5 w-5 text-[#FF4D2E]" />
+                    <p className="font-mono text-[10px] leading-relaxed text-[#C4C7D0]">
+                      {videoDecodeError}
+                    </p>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-6 text-center">
+                <Film className="h-5 w-5 text-[#555966]" />
+                <p className="font-mono text-[11px] text-[#8B8F9C]">
+                  No video loaded
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Color Tint / Matte Fade / Vignette Preview Overlays */}
+          {videoFilter && Math.abs(videoFilter.temperature) > 0.01 && (
+            <div
+              className="pointer-events-none absolute inset-0 z-[1]"
+              style={{
+                backgroundColor:
+                  videoFilter.temperature < 0
+                    ? `rgba(12, 68, 92, ${Math.min(0.42, Math.abs(videoFilter.temperature) * 0.42)})`
+                    : `rgba(180, 105, 40, ${Math.min(0.32, videoFilter.temperature * 0.32)})`,
+                mixBlendMode: videoFilter.temperature < 0 ? "color" : "soft-light",
+              }}
+            />
+          )}
+          {videoFilter && videoFilter.fade > 0.005 && (
+            <div
+              className="pointer-events-none absolute inset-0 z-[1]"
+              style={{
+                backgroundColor: `rgba(14, 24, 32, ${Math.min(0.35, videoFilter.fade * 0.75)})`,
+                mixBlendMode: "lighten",
+              }}
+            />
+          )}
+          {videoFilter && videoFilter.vignette > 0.005 && (
+            <div
+              className="pointer-events-none absolute inset-0 z-[1]"
+              style={{
+                background: `radial-gradient(circle at 50% 48%, rgba(0,0,0,0) ${Math.round(52 - videoFilter.vignette * 20)}%, rgba(0,0,0,${(videoFilter.vignette * 0.72).toFixed(2)}) 100%)`,
+              }}
+            />
           )}
 
           {effectiveBeatPlaying && activeSegLabel && (
@@ -413,8 +597,64 @@ export function HookPreviewStage({
             className="pointer-events-none absolute inset-0 z-[2] h-full w-full"
           />
 
+          {/* Interactive Corner-Drag Crop Overlay */}
+          {isCropping && onChangeCrop && (
+            <div className="absolute inset-0 z-[4]">
+              <div
+                onPointerDown={(e) => startCropDrag(e, "move")}
+                onPointerMove={handleCropPointerMove}
+                onPointerUp={endCropDrag}
+                onPointerCancel={endCropDrag}
+                style={{
+                  left: `${activeCrop.x * 100}%`,
+                  top: `${activeCrop.y * 100}%`,
+                  width: `${activeCrop.width * 100}%`,
+                  height: `${activeCrop.height * 100}%`,
+                  boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.62)",
+                }}
+                className="absolute cursor-move border-2 border-[#FF4D2E]"
+              >
+                {/* Rule-of-thirds guides */}
+                <div className="pointer-events-none absolute inset-x-0 top-1/3 h-px bg-white/20" />
+                <div className="pointer-events-none absolute inset-x-0 top-2/3 h-px bg-white/20" />
+                <div className="pointer-events-none absolute inset-y-0 left-1/3 w-px bg-white/20" />
+                <div className="pointer-events-none absolute inset-y-0 left-2/3 w-px bg-white/20" />
+
+                {/* 4 Draggable Corner Handles */}
+                {(
+                  [
+                    { id: "nw", pos: "-left-2 -top-2 cursor-nwse-resize" },
+                    { id: "ne", pos: "-right-2 -top-2 cursor-nesw-resize" },
+                    { id: "sw", pos: "-bottom-2 -left-2 cursor-nesw-resize" },
+                    { id: "se", pos: "-bottom-2 -right-2 cursor-nwse-resize" },
+                  ] as const
+                ).map((c) => (
+                  <div
+                    key={c.id}
+                    onPointerDown={(e) => startCropDrag(e, c.id)}
+                    onPointerMove={handleCropPointerMove}
+                    onPointerUp={endCropDrag}
+                    onPointerCancel={endCropDrag}
+                    className={`absolute h-4 w-4 rounded-sm border-2 border-white bg-[#FF4D2E] shadow-md ${c.pos}`}
+                  />
+                ))}
+              </div>
+
+              {cropEnabled && (
+                <button
+                  type="button"
+                  onClick={() => onChangeCrop({ ...DEFAULT_VIDEO_CROP })}
+                  className="nb-key absolute bottom-2.5 left-1/2 z-10 inline-flex -translate-x-1/2 items-center gap-1 rounded-full bg-black/85 px-2.5 py-1 font-mono text-[10px] font-semibold text-white"
+                >
+                  <RotateCcw className="h-2.5 w-2.5" />
+                  <span>Reset Crop</span>
+                </button>
+              )}
+            </div>
+          )}
+
           {/* TikTok / Reels Safe Zone Guide */}
-          {showSafeZone && (
+          {showSafeZone && !isCropping && (
             <div className="pointer-events-none absolute inset-0 z-[3]">
               <div className="absolute inset-x-0 top-0 h-[10%] border-b border-dashed border-white/20 bg-black/20" />
               <div className="absolute bottom-[14%] right-0 h-[36%] w-[16%] border-l border-t border-b border-dashed border-white/20 bg-black/20" />

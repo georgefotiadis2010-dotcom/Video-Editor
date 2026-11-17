@@ -4,6 +4,30 @@ export type PillStyleOption = "black" | "crimson" | "white" | "outline";
 
 export type AspectMode = "force-9x16" | "original";
 
+export interface VideoCropRect {
+  x: number; // 0..1 normalized left
+  y: number; // 0..1 normalized top
+  width: number; // 0.15..1 normalized width
+  height: number; // 0.15..1 normalized height
+}
+
+export type VideoFilterPresetId =
+  | "none"
+  | "midnight-studio"
+  | "warm-film"
+  | "crisp-pop"
+  | "bw-noir";
+
+export interface VideoFilterConfig {
+  preset: VideoFilterPresetId;
+  brightness: number; // -0.3 .. 0.3
+  contrast: number; // 0.6 .. 1.6
+  saturation: number; // 0 .. 2.0
+  temperature: number; // -1 .. 1 (negative = cool teal/blue, positive = warm)
+  fade: number; // 0 .. 0.35 (matte black lift)
+  vignette: number; // 0 .. 1
+}
+
 export interface TextStyleConfig {
   fontFamily: FontFamilyOption;
   fontSize: number; // Base px at 1080w
