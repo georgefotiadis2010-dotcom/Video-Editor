@@ -26,7 +26,11 @@ import { Header } from "@/components/Header";
 import { HookPreviewStage } from "@/components/HookPreviewStage";
 import {
   cleanupSourceFile,
+  formatFFmpegError,
   getFFmpeg,
+  isFFmpegLoaded,
+  prepareSingleLoopBase,
+  renderHookOnSingleLoopBase,
   renderSingleHookVideo,
   resetFFmpeg,
 } from "@/lib/ffmpeg-client";
@@ -80,6 +84,9 @@ export function BatchRendererApp() {
   const clipsRef = useRef<RenderedClip[]>([]);
 
   const [video, setVideo] = useState<VideoMetadata | null>(null);
+  const [uploadingVideoName, setUploadingVideoName] = useState<string | null>(
+    null
+  );
   const [isDragging, setIsDragging] = useState(false);
 
   const [hooksText, setHooksText] = useState<string>(
@@ -99,6 +106,7 @@ export function BatchRendererApp() {
   );
   const [currentClipIndex, setCurrentClipIndex] = useState(0);
   const [currentClipProgress, setCurrentClipProgress] = useState(0);
+  const [isPreparingBase, setIsPreparingBase] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
@@ -138,6 +146,15 @@ export function BatchRendererApp() {
     return () => window.clearInterval(timer);
   }, [phase]);
 
+  useEffect(() => {
+    if (!previewClip) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPreviewClip(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [previewClip]);
+
   const clearRenderedClips = useCallback(() => {
     setRenderedClips((prev) => {
       for (const clip of prev) {
@@ -155,26 +172,37 @@ export function BatchRendererApp() {
     }
 
     setErrorMessage(null);
+    setUploadingVideoName(file.name);
     const objectUrl = URL.createObjectURL(file);
     const probe = document.createElement("video");
     probe.preload = "metadata";
     probe.src = objectUrl;
 
     probe.onloadedmetadata = () => {
+      const nextWidth = probe.videoWidth || 1080;
+      const nextHeight = probe.videoHeight || 1920;
+      const nextDuration = probe.duration || 0;
+      probe.removeAttribute("src");
+      probe.load();
+
+      setUploadingVideoName(null);
       setVideo((prev) => {
         if (prev?.url) URL.revokeObjectURL(prev.url);
         return {
           file,
           url: objectUrl,
-          width: probe.videoWidth || 1080,
-          height: probe.videoHeight || 1920,
-          duration: probe.duration || 0,
+          width: nextWidth,
+          height: nextHeight,
+          duration: nextDuration,
           sizeBytes: file.size,
         };
       });
     };
 
     probe.onerror = () => {
+      probe.removeAttribute("src");
+      probe.load();
+      setUploadingVideoName(null);
       URL.revokeObjectURL(objectUrl);
       setErrorMessage(
         "Could not read video metadata. Try an H.264 MP4 or MOV file."
@@ -243,87 +271,115 @@ export function BatchRendererApp() {
       }
 
       setPhase("rendering");
-      let sourceWritten = false;
-
-      for (let i = 0; i < hooks.length; i++) {
-        if (cancelRequestedRef.current) {
-          setPhase("cancelled");
-          setStatusMessage(
-            `Cancelled after rendering ${i} of ${hooks.length} clips.`
+      try {
+        const useSharedBase = hooks.length > 1;
+        if (useSharedBase) {
+          setIsPreparingBase(true);
+          setStatusMessage("Preparing normalized background loop once...");
+          await prepareSingleLoopBase(
+            ffmpeg,
+            video.file,
+            aspectMode,
+            muteAudio,
+            (ratio) => setCurrentClipProgress(ratio)
           );
-          break;
+          setIsPreparingBase(false);
         }
 
-        const hookText = hooks[i];
-        const filename = slugifyHook(hookText, i);
-        setCurrentClipIndex(i);
-        setCurrentClipProgress(0);
-        setStatusMessage(
-          `Rendering clip ${i + 1} of ${hooks.length}: "${hookText.slice(0, 48)}${hookText.length > 48 ? "…" : ""}"`
-        );
+        let sourceWritten = false;
 
-        const clipStart = performance.now();
-        const overlayPngBytes = await renderHookOverlayPng(
-          targetWidth,
-          targetHeight,
-          hookText,
-          styleConfig
-        );
+        for (let i = 0; i < hooks.length; i++) {
+          if (cancelRequestedRef.current) {
+            setPhase("cancelled");
+            setStatusMessage(
+              `Cancelled after rendering ${i} of ${hooks.length} clips.`
+            );
+            break;
+          }
 
-        const blob = await renderSingleHookVideo({
-          ffmpeg,
-          sourceFile: video.file,
-          sourceWritten,
-          overlayPngBytes,
-          outputFilename: filename,
-          aspectMode,
-          muteAudio,
-          onProgress: (ratio) => setCurrentClipProgress(ratio),
-        });
+          const hookText = hooks[i];
+          const filename = slugifyHook(hookText, i);
+          setCurrentClipIndex(i);
+          setCurrentClipProgress(0);
+          setStatusMessage(
+            `Rendering clip ${i + 1} of ${hooks.length}: "${hookText.slice(0, 48)}${hookText.length > 48 ? "…" : ""}"`
+          );
 
-        sourceWritten = true;
+          const clipStart = performance.now();
+          const overlayPngBytes = await renderHookOverlayPng(
+            targetWidth,
+            targetHeight,
+            hookText,
+            styleConfig
+          );
 
-        if (cancelRequestedRef.current) {
-          setPhase("cancelled");
-          setStatusMessage("Batch render cancelled.");
-          break;
+          const blob = useSharedBase
+            ? await renderHookOnSingleLoopBase(
+                ffmpeg,
+                overlayPngBytes,
+                filename,
+                muteAudio,
+                (ratio) => setCurrentClipProgress(ratio)
+              )
+            : await renderSingleHookVideo({
+                ffmpeg,
+                sourceFile: video.file,
+                sourceWritten,
+                overlayPngBytes,
+                outputFilename: filename,
+                aspectMode,
+                muteAudio,
+                onProgress: (ratio) => setCurrentClipProgress(ratio),
+              });
+
+          sourceWritten = true;
+
+          if (cancelRequestedRef.current) {
+            setPhase("cancelled");
+            setStatusMessage("Batch render cancelled.");
+            break;
+          }
+
+          const url = URL.createObjectURL(blob);
+          const clip: RenderedClip = {
+            id: `${i}-${Date.now()}`,
+            index: i,
+            hookText,
+            filename,
+            blob,
+            url,
+            sizeBytes: blob.size,
+            renderMs: Math.round(performance.now() - clipStart),
+          };
+
+          setRenderedClips((prev) => [...prev, clip]);
+
+          if (autoDownloadEach) {
+            triggerDownload(url, filename);
+          }
         }
 
-        const url = URL.createObjectURL(blob);
-        const clip: RenderedClip = {
-          id: `${i}-${Date.now()}`,
-          index: i,
-          hookText,
-          filename,
-          blob,
-          url,
-          sizeBytes: blob.size,
-          renderMs: Math.round(performance.now() - clipStart),
-        };
-
-        setRenderedClips((prev) => [...prev, clip]);
-
-        if (autoDownloadEach) {
-          triggerDownload(url, filename);
+        if (!cancelRequestedRef.current) {
+          setPhase("completed");
+          setCurrentClipProgress(1);
+          setStatusMessage(
+            `Done! Rendered ${hooks.length} unique MP4${hooks.length === 1 ? "" : "s"} locally.`
+          );
         }
-      }
-
-      if (!cancelRequestedRef.current) {
+      } finally {
         await cleanupSourceFile(ffmpeg);
-        setPhase("completed");
-        setCurrentClipProgress(1);
-        setStatusMessage(
-          `Done! Rendered ${hooks.length} unique MP4${hooks.length === 1 ? "" : "s"} locally.`
-        );
       }
     } catch (err) {
+      setIsPreparingBase(false);
       if (cancelRequestedRef.current) {
         setPhase("cancelled");
         setStatusMessage("Batch render cancelled.");
         return;
       }
-      const message =
-        err instanceof Error ? err.message : "Unknown FFmpeg rendering error.";
+      if (!isFFmpegLoaded()) {
+        resetFFmpeg();
+      }
+      const message = formatFFmpegError(err);
       setPhase("error");
       setErrorMessage(message);
       setStatusMessage("Render failed. Check the error message below.");
@@ -333,6 +389,7 @@ export function BatchRendererApp() {
   const handleCancelBatch = () => {
     cancelRequestedRef.current = true;
     resetFFmpeg();
+    setIsPreparingBase(false);
     setPhase("cancelled");
     setStatusMessage("Batch render cancelled and FFmpeg worker reset.");
   };
@@ -345,7 +402,10 @@ export function BatchRendererApp() {
       for (const clip of renderedClips) {
         zip.file(clip.filename, clip.blob);
       }
-      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const zipBlob = await zip.generateAsync({
+        type: "blob",
+        compression: "STORE",
+      });
       const zipUrl = URL.createObjectURL(zipBlob);
       triggerDownload(
         zipUrl,
@@ -362,8 +422,10 @@ export function BatchRendererApp() {
     hooks.length > 0
       ? Math.min(
           1,
-          (renderedClips.length + (isBusy ? currentClipProgress : 0)) /
-            hooks.length
+          isPreparingBase
+            ? (currentClipProgress * 0.15)
+            : (renderedClips.length + (isBusy ? currentClipProgress : 0)) /
+                hooks.length
         )
       : 0;
 
@@ -437,7 +499,7 @@ export function BatchRendererApp() {
           aria-labelledby="tab-beat-sync"
           hidden={editorMode !== "beat-sync"}
         >
-          {editorMode === "beat-sync" && <BeatSyncEditor />}
+          <BeatSyncEditor />
         </div>
 
         {/* Single-Loop Panel */}
@@ -514,7 +576,25 @@ export function BatchRendererApp() {
                   }}
                 />
 
-                {video ? (
+                {uploadingVideoName ? (
+                  <div className="flex w-full flex-col gap-2.5 text-left">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="flex min-w-0 items-center gap-2 font-medium text-[#F5F5F2]">
+                        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[#FF4D2E]" />
+                        <span className="truncate">
+                          Loading {uploadingVideoName}…
+                        </span>
+                      </span>
+                      <span className="shrink-0 font-mono text-[11px] text-[#9A9DA8]">
+                        Reading metadata
+                      </span>
+                    </div>
+                    <progress
+                      className="lxg-progress"
+                      aria-label="Loading background video loop"
+                    />
+                  </div>
+                ) : video ? (
                   <div className="flex w-full flex-col items-center justify-between gap-3 sm:flex-row sm:text-left">
                     <div className="flex items-center gap-3">
                       <div className="nb-key flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-[#FF4D2E]">
@@ -870,6 +950,80 @@ export function BatchRendererApp() {
                     className="nb-slider"
                   />
                 </div>
+
+                {/* Text Width */}
+                <div>
+                  <div className="mb-1 flex justify-between text-xs">
+                    <label
+                      htmlFor="max-width-range"
+                      className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]"
+                    >
+                      Text Width
+                    </label>
+                    <span className="font-mono font-bold text-[#F5F5F2]">
+                      {styleConfig.maxWidthPercent}%
+                    </span>
+                  </div>
+                  <input
+                    id="max-width-range"
+                    type="range"
+                    min={55}
+                    max={92}
+                    value={styleConfig.maxWidthPercent}
+                    disabled={isBusy}
+                    onChange={(e) =>
+                      setStyleConfig((p) => ({
+                        ...p,
+                        maxWidthPercent: Number(e.target.value),
+                      }))
+                    }
+                    style={
+                      {
+                        "--attr-min": 55,
+                        "--attr-max": 92,
+                        "--control-value": styleConfig.maxWidthPercent,
+                      } as React.CSSProperties
+                    }
+                    className="nb-slider"
+                  />
+                </div>
+
+                {/* Backdrop Opacity */}
+                <div>
+                  <div className="mb-1 flex justify-between text-xs">
+                    <label
+                      htmlFor="pill-opacity-range"
+                      className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]"
+                    >
+                      Backdrop Opacity
+                    </label>
+                    <span className="font-mono font-bold text-[#F5F5F2]">
+                      {Math.round(styleConfig.pillOpacity * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    id="pill-opacity-range"
+                    type="range"
+                    min={30}
+                    max={100}
+                    value={Math.round(styleConfig.pillOpacity * 100)}
+                    disabled={isBusy}
+                    onChange={(e) =>
+                      setStyleConfig((p) => ({
+                        ...p,
+                        pillOpacity: Number(e.target.value) / 100,
+                      }))
+                    }
+                    style={
+                      {
+                        "--attr-min": 30,
+                        "--attr-max": 100,
+                        "--control-value": Math.round(styleConfig.pillOpacity * 100),
+                      } as React.CSSProperties
+                    }
+                    className="nb-slider"
+                  />
+                </div>
               </div>
 
               {/* Uppercase + Text Color */}
@@ -1003,7 +1157,9 @@ export function BatchRendererApp() {
                     <div>
                       <div className="mb-1.5 flex justify-between text-[11px]">
                         <span className="text-[#9A9DA8]">
-                          Clip #{currentClipIndex + 1} encoding
+                          {isPreparingBase
+                            ? "Preparing background loop"
+                            : `Clip #${currentClipIndex + 1} encoding`}
                         </span>
                         <span className="font-mono font-bold text-[#FF4D2E]">
                           {Math.round(currentClipProgress * 100)}%
@@ -1011,7 +1167,11 @@ export function BatchRendererApp() {
                       </div>
                       <progress
                         className="lxg-progress"
-                        aria-label="Current clip encode progress"
+                        aria-label={
+                          isPreparingBase
+                            ? "Background loop preparation progress"
+                            : "Current clip encode progress"
+                        }
                         value={currentClipProgress}
                         max={1}
                       />

@@ -105,6 +105,29 @@ export function resolveCanvasFont(
   }
 }
 
+function breakLongWord(
+  ctx: CanvasRenderingContext2D,
+  word: string,
+  maxWidth: number
+): string[] {
+  if (ctx.measureText(word).width <= maxWidth || word.length <= 1) {
+    return [word];
+  }
+  const chunks: string[] = [];
+  let part = "";
+  for (const ch of word) {
+    const next = part + ch;
+    if (part && ctx.measureText(next).width > maxWidth) {
+      chunks.push(part);
+      part = ch;
+    } else {
+      part = next;
+    }
+  }
+  if (part) chunks.push(part);
+  return chunks;
+}
+
 function wrapTextLines(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -114,9 +137,10 @@ function wrapTextLines(
   const lines: string[] = [];
 
   for (const para of paragraphs) {
-    const words = para.trim().split(/\s+/).filter(Boolean);
-    if (words.length === 0) continue;
+    const rawWords = para.trim().split(/\s+/).filter(Boolean);
+    if (rawWords.length === 0) continue;
 
+    const words = rawWords.flatMap((w) => breakLongWord(ctx, w, maxWidth));
     let current = words[0];
     for (let i = 1; i < words.length; i++) {
       const candidate = `${current} ${words[i]}`;

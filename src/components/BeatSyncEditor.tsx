@@ -24,12 +24,18 @@ import {
 } from "lucide-react";
 import { HookPreviewStage } from "@/components/HookPreviewStage";
 import { WaveformBeatEditor } from "@/components/WaveformBeatEditor";
-import { analyzeAudioFile, selectCutsInWindow } from "@/lib/beat-detector";
+import {
+  analyzeAudioFile,
+  rescaleAnalysisBpm,
+  selectCutsInWindow,
+} from "@/lib/beat-detector";
 import { buildBeatCutPlan } from "@/lib/beat-planner";
 import {
   buildBeatSyncedBaseVideo,
   cleanupBeatSyncAssets,
+  formatFFmpegError,
   getFFmpeg,
+  isFFmpegLoaded,
   prepareBeatSyncAssets,
   renderHookOnSyncedBase,
   renderSingleBeatSyncedReel,
@@ -85,7 +91,7 @@ function probeVideoFile(file: File): Promise<SourceClipItem> {
     probe.src = objectUrl;
 
     probe.onloadedmetadata = () => {
-      resolve({
+      const item: SourceClipItem = {
         id: `${file.name}-${file.size}-${Math.random().toString(36).slice(2, 8)}`,
         file,
         url: objectUrl,
@@ -93,10 +99,15 @@ function probeVideoFile(file: File): Promise<SourceClipItem> {
         height: probe.videoHeight || 1920,
         duration: probe.duration || 1,
         sizeBytes: file.size,
-      });
+      };
+      probe.removeAttribute("src");
+      probe.load();
+      resolve(item);
     };
 
     probe.onerror = () => {
+      probe.removeAttribute("src");
+      probe.load();
       URL.revokeObjectURL(objectUrl);
       reject(new Error(`Could not read video metadata for ${file.name}`));
     };
@@ -142,6 +153,11 @@ export function BeatSyncEditor() {
     null
   );
   const [isAnalyzingAudio, setIsAnalyzingAudio] = useState(false);
+  const [audioUploadProgress, setAudioUploadProgress] = useState<{
+    ratio: number;
+    stage: string;
+    fileName: string;
+  } | null>(null);
   const [isDraggingAudio, setIsDraggingAudio] = useState(false);
   const [windowStart, setWindowStart] = useState(0);
   const [windowEnd, setWindowEnd] = useState(12);
@@ -150,6 +166,11 @@ export function BeatSyncEditor() {
 
   // Raw Clips State
   const [clips, setClips] = useState<SourceClipItem[]>([]);
+  const [clipUploadProgress, setClipUploadProgress] = useState<{
+    current: number;
+    total: number;
+    fileName: string;
+  } | null>(null);
   const [isDraggingVideos, setIsDraggingVideos] = useState(false);
   const [draggedClipId, setDraggedClipId] = useState<string | null>(null);
   const [dragOverClipId, setDragOverClipId] = useState<string | null>(null);
@@ -169,6 +190,17 @@ export function BeatSyncEditor() {
 
   // Render State
   const [phase, setPhase] = useState<RenderPhase>("idle");
+  const [editStage, setEditStage] = useState<
+    | "idle"
+    | "loading-ffmpeg"
+    | "loading-assets"
+    | "building-edit"
+    | "rendering-reels"
+    | "completed"
+    | "cancelled"
+    | "error"
+  >("idle");
+  const [editStepLabel, setEditStepLabel] = useState("");
   const [statusMessage, setStatusMessage] = useState(
     "Add your song, raw clips, and hooks — we'll cut to the beat drops."
   );
@@ -210,13 +242,14 @@ export function BeatSyncEditor() {
     };
   }, []);
 
+  const audioUrl = audioAnalysis?.url;
   useEffect(() => {
-    if (audioAnalysis) {
+    if (audioUrl) {
       return () => {
-        URL.revokeObjectURL(audioAnalysis.url);
+        URL.revokeObjectURL(audioUrl);
       };
     }
-  }, [audioAnalysis]);
+  }, [audioUrl]);
 
   useEffect(() => {
     if (phase !== "loading-ffmpeg" && phase !== "rendering") return;
@@ -250,6 +283,17 @@ export function BeatSyncEditor() {
     return buildBeatCutPlan(activeCuts, windowStart, windowEnd, clips);
   }, [audioAnalysis, activeCuts, windowStart, windowEnd, clips]);
 
+  const beatSyncPreview = useMemo(() => {
+    if (!audioAnalysis || previewPlan.length === 0) return null;
+    return {
+      audioUrl: audioAnalysis.url,
+      windowStart,
+      windowEnd,
+      segments: previewPlan,
+      clips,
+    };
+  }, [audioAnalysis, previewPlan, windowStart, windowEnd, clips]);
+
   const clearRenderedClips = useCallback(() => {
     setRenderedClips((prev) => {
       for (const clip of prev) {
@@ -273,10 +317,17 @@ export function BeatSyncEditor() {
 
     setErrorMessage(null);
     setIsAnalyzingAudio(true);
+    setAudioUploadProgress({
+      ratio: 0,
+      stage: "Reading audio file…",
+      fileName: file.name,
+    });
     setStatusMessage(`Scanning beat drops in "${file.name}"...`);
 
     try {
-      const analysis = await analyzeAudioFile(file);
+      const analysis = await analyzeAudioFile(file, (info) => {
+        setAudioUploadProgress({ ...info, fileName: file.name });
+      });
       setAudioAnalysis(analysis);
       setWindowStart(analysis.recommendedStart);
       setWindowEnd(analysis.recommendedEnd);
@@ -290,6 +341,7 @@ export function BeatSyncEditor() {
       setErrorMessage(msg);
     } finally {
       setIsAnalyzingAudio(false);
+      setAudioUploadProgress(null);
     }
   }, []);
 
@@ -306,22 +358,41 @@ export function BeatSyncEditor() {
     }
 
     setErrorMessage(null);
-    const loaded: SourceClipItem[] = [];
-    for (const file of files) {
-      try {
-        const item = await probeVideoFile(file);
-        loaded.push(item);
-      } catch {
-        // Skip unreadable clip and continue
+    let loadedCount = 0;
+    setClipUploadProgress({
+      current: 0,
+      total: files.length,
+      fileName: files[0].name,
+    });
+
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        setClipUploadProgress({
+          current: i,
+          total: files.length,
+          fileName: file.name,
+        });
+        try {
+          const item = await probeVideoFile(file);
+          loadedCount += 1;
+          setClips((prev) => [...prev, item]);
+        } catch {
+          // Skip unreadable clip and continue
+        }
+        setClipUploadProgress({
+          current: i + 1,
+          total: files.length,
+          fileName: file.name,
+        });
       }
-    }
 
-    if (loaded.length === 0) {
-      setErrorMessage("Could not read metadata from the selected video files.");
-      return;
+      if (loadedCount === 0) {
+        setErrorMessage("Could not read metadata from the selected video files.");
+      }
+    } finally {
+      setClipUploadProgress(null);
     }
-
-    setClips((prev) => [...prev, ...loaded]);
   }, []);
 
   const handleRemoveClip = (id: string) => {
@@ -349,6 +420,20 @@ export function BeatSyncEditor() {
     setCustomCuts(next);
   };
 
+  const handleScaleBpm = (multiplier: 0.5 | 2) => {
+    setAudioAnalysis((prev) => (prev ? rescaleAnalysisBpm(prev, multiplier) : prev));
+    setCustomCuts(null);
+  };
+
+  useEffect(() => {
+    if (!previewClip) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPreviewClip(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [previewClip]);
+
   const handleStartBatch = async () => {
     if (!audioAnalysis || clips.length === 0 || hooks.length === 0) return;
 
@@ -359,6 +444,8 @@ export function BeatSyncEditor() {
     setCurrentClipIndex(0);
     setCurrentClipProgress(0);
     setPhase("loading-ffmpeg");
+    setEditStage("loading-ffmpeg");
+    setEditStepLabel("Initializing FFmpeg.wasm…");
     setStatusMessage("Initializing local FFmpeg.wasm engine...");
 
     const firstClip = clips[0];
@@ -375,11 +462,15 @@ export function BeatSyncEditor() {
       const ffmpeg = await getFFmpeg();
       if (cancelRequestedRef.current) {
         setPhase("cancelled");
+        setEditStage("cancelled");
         setStatusMessage("Beat-sync render cancelled.");
         return;
       }
 
       setPhase("rendering");
+      setEditStage("loading-assets");
+      setCurrentClipProgress(0);
+      setEditStepLabel(`Loading ${clips.length + 1} files into editor…`);
       setStatusMessage(
         `Loading ${clips.length} clip${clips.length === 1 ? "" : "s"} & song locally...`
       );
@@ -387,7 +478,11 @@ export function BeatSyncEditor() {
       const { clipFileMap, audioFileName } = await prepareBeatSyncAssets(
         ffmpeg,
         clips,
-        audioAnalysis.file
+        audioAnalysis.file,
+        (done, total, name) => {
+          setCurrentClipProgress(done / total);
+          setEditStepLabel(`Loading ${name} (${done}/${total})`);
+        }
       );
 
       try {
@@ -402,6 +497,9 @@ export function BeatSyncEditor() {
             throw new Error("No valid beat segments in the selected window.");
           }
 
+          setEditStage("building-edit");
+          setCurrentClipProgress(0);
+          setEditStepLabel(`Making beat-synced edit (${basePlan.length} cuts)…`);
           setStatusMessage(
             `Chopping ${basePlan.length} beat cuts & syncing song...`
           );
@@ -418,9 +516,11 @@ export function BeatSyncEditor() {
           });
         }
 
+        setEditStage("rendering-reels");
         for (let i = 0; i < hooks.length; i++) {
           if (cancelRequestedRef.current) {
             setPhase("cancelled");
+            setEditStage("cancelled");
             setStatusMessage(
               `Cancelled after rendering ${i} of ${hooks.length} Reels.`
             );
@@ -431,6 +531,7 @@ export function BeatSyncEditor() {
           const filename = slugifyHook(hookText, i);
           setCurrentClipIndex(i);
           setCurrentClipProgress(0);
+          setEditStepLabel(`Reel ${i + 1} / ${hooks.length} encoding`);
           setStatusMessage(
             `Rendering Reel ${i + 1}/${hooks.length}: "${hookText.slice(0, 40)}${hookText.length > 40 ? "…" : ""}"`
           );
@@ -460,6 +561,9 @@ export function BeatSyncEditor() {
               clips,
               seed
             );
+            if (plan.length === 0) {
+              throw new Error("No valid beat segments in the selected window.");
+            }
             blob = await renderSingleBeatSyncedReel({
               ffmpeg,
               segments: plan,
@@ -477,6 +581,7 @@ export function BeatSyncEditor() {
 
           if (cancelRequestedRef.current) {
             setPhase("cancelled");
+            setEditStage("cancelled");
             setStatusMessage("Beat-sync render cancelled.");
             break;
           }
@@ -501,6 +606,7 @@ export function BeatSyncEditor() {
 
         if (!cancelRequestedRef.current) {
           setPhase("completed");
+          setEditStage("completed");
           setCurrentClipProgress(1);
           setStatusMessage(
             `Done! ${hooks.length} beat-synced Reel${hooks.length === 1 ? "" : "s"} ready to post.`
@@ -512,12 +618,16 @@ export function BeatSyncEditor() {
     } catch (err) {
       if (cancelRequestedRef.current) {
         setPhase("cancelled");
+        setEditStage("cancelled");
         setStatusMessage("Beat-sync render cancelled.");
         return;
       }
-      const message =
-        err instanceof Error ? err.message : "Unknown FFmpeg rendering error.";
+      if (!isFFmpegLoaded()) {
+        resetFFmpeg();
+      }
+      const message = formatFFmpegError(err);
       setPhase("error");
+      setEditStage("error");
       setErrorMessage(message);
       setStatusMessage("Render failed. Check the error message below.");
     }
@@ -527,6 +637,7 @@ export function BeatSyncEditor() {
     cancelRequestedRef.current = true;
     resetFFmpeg();
     setPhase("cancelled");
+    setEditStage("cancelled");
     setStatusMessage("Render cancelled and FFmpeg worker reset.");
   };
 
@@ -538,7 +649,10 @@ export function BeatSyncEditor() {
       for (const clip of renderedClips) {
         zip.file(clip.filename, clip.blob);
       }
-      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const zipBlob = await zip.generateAsync({
+        type: "blob",
+        compression: "STORE",
+      });
       const zipUrl = URL.createObjectURL(zipBlob);
       triggerDownload(
         zipUrl,
@@ -560,10 +674,32 @@ export function BeatSyncEditor() {
         : null;
 
   const canRender = missingStep === null && !isBusy;
-  const overallRatio =
-    hooks.length > 0
-      ? (currentClipIndex + currentClipProgress) / hooks.length
+  const overallRatio = useMemo(() => {
+    if (editStage === "completed") return 1;
+    if (editStage === "idle" || editStage === "loading-ffmpeg") return 0;
+    if (editStage === "loading-assets") {
+      return Math.min(0.05, currentClipProgress * 0.05);
+    }
+    if (editStage === "building-edit") {
+      return 0.05 + Math.min(0.2, currentClipProgress * 0.2);
+    }
+    if (editStage === "rendering-reels" && hooks.length > 0) {
+      const baseOffset = arrangementMode === "shared-edit" ? 0.25 : 0.05;
+      const reelProgress =
+        (currentClipIndex + currentClipProgress) / hooks.length;
+      return Math.min(1, baseOffset + (1 - baseOffset) * reelProgress);
+    }
+    return hooks.length > 0
+      ? Math.min(1, (renderedClips.length + currentClipProgress) / hooks.length)
       : 0;
+  }, [
+    arrangementMode,
+    currentClipIndex,
+    currentClipProgress,
+    editStage,
+    hooks.length,
+    renderedClips.length,
+  ]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -626,11 +762,29 @@ export function BeatSyncEditor() {
             />
 
             {isAnalyzingAudio ? (
-              <div className="nb-well flex items-center justify-center gap-2.5 rounded-2xl py-8">
-                <Loader2 className="h-4 w-4 animate-spin text-[#FF4D2E]" />
-                <span className="font-mono text-xs text-[#9A9DA8]">
-                  Analyzing BPM & drops...
-                </span>
+              <div className="nb-well flex flex-col gap-2.5 rounded-2xl p-4">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="flex min-w-0 items-center gap-2 font-medium text-[#F5F5F2]">
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[#FF4D2E]" />
+                    <span className="truncate">
+                      {audioUploadProgress?.stage ?? "Analyzing BPM & drops…"}
+                    </span>
+                  </span>
+                  <span className="shrink-0 font-mono font-bold text-[#FF4D2E]">
+                    {Math.round((audioUploadProgress?.ratio ?? 0) * 100)}%
+                  </span>
+                </div>
+                <progress
+                  className="lxg-progress"
+                  aria-label="Song upload and beat analysis progress"
+                  value={audioUploadProgress?.ratio ?? 0}
+                  max={1}
+                />
+                {audioUploadProgress?.fileName && (
+                  <p className="truncate font-mono text-[10px] text-[#8B8F9C]">
+                    {audioUploadProgress.fileName}
+                  </p>
+                )}
               </div>
             ) : !audioAnalysis ? (
               <div
@@ -694,6 +848,7 @@ export function BeatSyncEditor() {
                   }}
                   onResetAutoBeats={() => setCustomCuts(null)}
                   hasCustomBeats={customCuts !== null}
+                  onScaleBpm={handleScaleBpm}
                 />
               </div>
             )}
@@ -762,7 +917,9 @@ export function BeatSyncEditor() {
                 }
               }}
               onClick={() => {
-                if (clips.length === 0) videosInputRef.current?.click();
+                if (clips.length === 0 && !clipUploadProgress) {
+                  videosInputRef.current?.click();
+                }
               }}
               className={`nb-well rounded-2xl border-2 border-dashed transition ${
                 clips.length === 0 ? "cursor-pointer px-4 py-5" : "p-3"
@@ -772,7 +929,35 @@ export function BeatSyncEditor() {
                   : "border-white/15 hover:border-[#FF4D2E]/60"
               }`}
             >
-              {clips.length === 0 ? (
+              {clipUploadProgress && (
+                <div className="mb-3 flex flex-col gap-2 rounded-xl border border-white/10 bg-[#0d0e12]/70 p-3">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="flex min-w-0 items-center gap-2 font-medium text-[#F5F5F2]">
+                      <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[#FF4D2E]" />
+                      <span className="truncate">
+                        Uploading {clipUploadProgress.fileName}
+                      </span>
+                    </span>
+                    <span className="shrink-0 font-mono text-[11px] font-bold text-[#FF4D2E]">
+                      {clipUploadProgress.current} / {clipUploadProgress.total} (
+                      {Math.round(
+                        (clipUploadProgress.current /
+                          Math.max(1, clipUploadProgress.total)) *
+                          100
+                      )}
+                      %)
+                    </span>
+                  </div>
+                  <progress
+                    className="lxg-progress"
+                    aria-label="Raw video clips upload progress"
+                    value={clipUploadProgress.current}
+                    max={Math.max(1, clipUploadProgress.total)}
+                  />
+                </div>
+              )}
+
+              {clips.length === 0 && !clipUploadProgress ? (
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
                     <Upload className="h-4 w-4 text-[#FF4D2E]" />
@@ -845,7 +1030,13 @@ export function BeatSyncEditor() {
                           loop
                           playsInline
                           preload="metadata"
-                          onMouseEnter={(e) => e.currentTarget.play().catch(() => {})}
+                          disablePictureInPicture
+                          disableRemotePlayback
+                          onMouseEnter={(e) => {
+                            if (!isBusy) {
+                              e.currentTarget.play().catch(() => {});
+                            }
+                          }}
                           onMouseLeave={(e) => {
                             e.currentTarget.pause();
                             e.currentTarget.currentTime = 0;
@@ -960,12 +1151,36 @@ export function BeatSyncEditor() {
               disabled={isBusy}
               onChange={(e) => {
                 setHooksText(e.target.value);
-                setActiveHookIndex(0);
               }}
               rows={5}
               placeholder="One hook per line..."
               className="nb-well nb-scroll w-full rounded-2xl px-4 py-3 font-sans text-sm leading-relaxed text-[#F5F5F2] placeholder-[#5A5E6B] focus:border-[#FF4D2E] focus:outline-none disabled:opacity-60"
             />
+
+            {hooks.length > 0 && (
+              <div className="mt-3">
+                <div className="nb-scroll flex max-h-20 flex-wrap gap-1.5 overflow-y-auto pr-1">
+                  {hooks.map((hook, idx) => (
+                    <button
+                      key={`${idx}-${hook.slice(0, 12)}`}
+                      type="button"
+                      onClick={() => setActiveHookIndex(idx)}
+                      className={`nb-key max-w-[210px] truncate rounded-xl px-2.5 py-1 text-left text-[11px] font-medium ${
+                        idx === Math.min(activeHookIndex, hooks.length - 1)
+                          ? "nb-key-active"
+                          : ""
+                      }`}
+                      title={hook}
+                    >
+                      <span className="mr-1 font-mono font-bold opacity-80">
+                        {String(idx + 1).padStart(2, "0")}
+                      </span>
+                      {hook}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Arrangement Toggle */}
             <div className="mt-3.5 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
@@ -1148,9 +1363,95 @@ export function BeatSyncEditor() {
                       className="nb-slider"
                     />
                   </div>
+
+                  <div>
+                    <div className="mb-1 flex justify-between text-xs">
+                      <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]">
+                        Text Width
+                      </span>
+                      <span className="font-mono font-bold text-[#F5F5F2]">
+                        {styleConfig.maxWidthPercent}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={55}
+                      max={92}
+                      value={styleConfig.maxWidthPercent}
+                      disabled={isBusy}
+                      onChange={(e) =>
+                        setStyleConfig((p) => ({
+                          ...p,
+                          maxWidthPercent: Number(e.target.value),
+                        }))
+                      }
+                      style={
+                        {
+                          "--attr-min": 55,
+                          "--attr-max": 92,
+                          "--control-value": styleConfig.maxWidthPercent,
+                        } as React.CSSProperties
+                      }
+                      className="nb-slider"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="mb-1 flex justify-between text-xs">
+                      <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]">
+                        Backdrop Opacity
+                      </span>
+                      <span className="font-mono font-bold text-[#F5F5F2]">
+                        {Math.round(styleConfig.pillOpacity * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={30}
+                      max={100}
+                      value={Math.round(styleConfig.pillOpacity * 100)}
+                      disabled={isBusy}
+                      onChange={(e) =>
+                        setStyleConfig((p) => ({
+                          ...p,
+                          pillOpacity: Number(e.target.value) / 100,
+                        }))
+                      }
+                      style={
+                        {
+                          "--attr-min": 30,
+                          "--attr-max": 100,
+                          "--control-value": Math.round(styleConfig.pillOpacity * 100),
+                        } as React.CSSProperties
+                      }
+                      className="nb-slider"
+                    />
+                  </div>
                 </div>
 
                 <div className="mt-3.5 flex flex-wrap items-center gap-4 border-t border-white/10 pt-3.5">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]">
+                      Color:
+                    </span>
+                    {["#FFFFFF", "#000000", "#FACC15", "#E11D48"].map((hex) => (
+                      <button
+                        key={hex}
+                        type="button"
+                        disabled={isBusy}
+                        onClick={() =>
+                          setStyleConfig((p) => ({ ...p, textColor: hex }))
+                        }
+                        aria-label={`Set text color ${hex}`}
+                        className={`h-6 w-6 rounded-full border-2 transition ${
+                          styleConfig.textColor === hex
+                            ? "scale-110 border-[#FF4D2E] ring-2 ring-[#FF4D2E]/50"
+                            : "border-white/25 hover:scale-105"
+                        }`}
+                        style={{ backgroundColor: hex }}
+                      />
+                    ))}
+                  </div>
                   <div className="flex items-center gap-2">
                     <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]">
                       Aspect:
@@ -1219,6 +1520,7 @@ export function BeatSyncEditor() {
             styleConfig={styleConfig}
             aspectMode={aspectMode}
             muteAudio={true}
+            beatSyncPreview={beatSyncPreview}
           />
 
           {/* Render Action Card */}
@@ -1238,21 +1540,58 @@ export function BeatSyncEditor() {
               {missingStep ?? statusMessage}
             </p>
 
-            {isBusy && (
-              <div className="nb-well mb-4 flex flex-col gap-2 rounded-2xl p-3">
-                <progress
-                  className="lxg-progress"
-                  value={Math.round(overallRatio * 100)}
-                  max={100}
-                />
-                <div className="flex justify-between font-mono text-[11px] text-[#C4C7D0]">
-                  <span>
-                    Reel {currentClipIndex + 1} / {hooks.length}
-                  </span>
-                  <span className="font-bold text-[#FF4D2E]">
-                    {Math.round(overallRatio * 100)}%
-                  </span>
+            {(isBusy || phase === "completed" || phase === "cancelled") && (
+              <div className="nb-well mb-4 space-y-3 rounded-2xl p-3.5">
+                <div>
+                  <div className="mb-1.5 flex justify-between text-xs">
+                    <span className="font-semibold text-[#C4C7D0]">
+                      Overall Progress
+                    </span>
+                    <span className="font-mono font-bold text-[#F5F5F2]">
+                      {renderedClips.length} / {hooks.length} (
+                      {Math.round(overallRatio * 100)}%)
+                    </span>
+                  </div>
+                  <progress
+                    className="lxg-progress"
+                    aria-label="Overall beat-sync edit progress"
+                    value={phase === "loading-ffmpeg" ? undefined : overallRatio}
+                    max={1}
+                  />
                 </div>
+
+                {isBusy && phase !== "loading-ffmpeg" && (
+                  <div>
+                    <div className="mb-1.5 flex justify-between gap-2 text-[11px]">
+                      <span className="truncate text-[#9A9DA8]">
+                        {editStepLabel || `Reel #${currentClipIndex + 1} encoding`}
+                      </span>
+                      <span className="shrink-0 font-mono font-bold text-[#FF4D2E]">
+                        {Math.round(currentClipProgress * 100)}%
+                      </span>
+                    </div>
+                    <progress
+                      className="lxg-progress"
+                      aria-label="Current edit step progress"
+                      value={currentClipProgress}
+                      max={1}
+                    />
+                  </div>
+                )}
+
+                <p
+                  role="status"
+                  aria-live="polite"
+                  className="flex items-center gap-2 text-xs text-[#C4C7D0]"
+                >
+                  {isBusy && (
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[#FF4D2E]" />
+                  )}
+                  {phase === "completed" && (
+                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  )}
+                  <span className="truncate">{statusMessage}</span>
+                </p>
               </div>
             )}
 

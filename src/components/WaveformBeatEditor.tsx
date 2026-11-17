@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Flame,
+  Maximize2,
+  Minimize2,
   Pause,
   Play,
   RotateCcw,
@@ -21,6 +23,7 @@ interface WaveformBeatEditorProps {
   onChangeDensity: (density: BeatDensity) => void;
   onResetAutoBeats: () => void;
   hasCustomBeats: boolean;
+  onScaleBpm?: (multiplier: 0.5 | 2) => void;
 }
 
 type DragMode = "none" | "start" | "end" | "move";
@@ -45,6 +48,7 @@ export function WaveformBeatEditor({
   onChangeDensity,
   onResetAutoBeats,
   hasCustomBeats,
+  onScaleBpm,
 }: WaveformBeatEditorProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -65,6 +69,14 @@ export function WaveformBeatEditor({
   const [isPlaying, setIsPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(windowStart);
   const [editBeatsMode, setEditBeatsMode] = useState(false);
+  const [zoomToWindow, setZoomToWindow] = useState(false);
+  const [canvasWidthTick, setCanvasWidthTick] = useState(0);
+
+  const viewStart = zoomToWindow ? Math.max(0, windowStart - 1.5) : 0;
+  const viewEnd = zoomToWindow
+    ? Math.min(analysis.duration, windowEnd + 1.5)
+    : analysis.duration;
+  const viewSpan = Math.max(0.5, viewEnd - viewStart);
 
   // Sync audio element
   useEffect(() => {
@@ -131,6 +143,15 @@ export function WaveformBeatEditor({
     }
   }, [analysis.duration]);
 
+  // Redraw waveform when container resizes
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || typeof ResizeObserver === "undefined") return;
+    const obs = new ResizeObserver(() => setCanvasWidthTick((t) => t + 1));
+    obs.observe(canvas);
+    return () => obs.disconnect();
+  }, []);
+
   // Draw waveform canvas
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -154,7 +175,7 @@ export function WaveformBeatEditor({
     ctx.clearRect(0, 0, width, height);
 
     const dur = Math.max(0.1, analysis.duration);
-    const timeToX = (t: number) => (t / dur) * width;
+    const timeToX = (t: number) => ((t - viewStart) / viewSpan) * width;
 
     const winX1 = timeToX(windowStart);
     const winX2 = timeToX(windowEnd);
@@ -163,15 +184,21 @@ export function WaveformBeatEditor({
     ctx.fillStyle = "rgba(255, 77, 46, 0.12)";
     ctx.fillRect(winX1, 0, Math.max(2, winX2 - winX1), height);
 
-    // Waveform bars
+    // Waveform bars mapped to [viewStart, viewEnd]
     const peaks = analysis.waveformPeaks;
-    const barW = width / peaks.length;
+    const startBucket = Math.max(0, Math.floor((viewStart / dur) * peaks.length));
+    const endBucket = Math.min(
+      peaks.length,
+      Math.ceil((viewEnd / dur) * peaks.length)
+    );
+    const visibleBuckets = Math.max(1, endBucket - startBucket);
+    const barW = width / visibleBuckets;
     const midY = height / 2;
     const maxBarH = height * 0.72;
 
-    for (let i = 0; i < peaks.length; i++) {
-      const x = i * barW;
+    for (let i = startBucket; i < endBucket; i++) {
       const barTime = (i / peaks.length) * dur;
+      const x = timeToX(barTime);
       const inWindow = barTime >= windowStart && barTime <= windowEnd;
       const h = Math.max(3, peaks[i] * maxBarH);
 
@@ -179,8 +206,9 @@ export function WaveformBeatEditor({
       ctx.fillRect(x, midY - h / 2, Math.max(1.5, barW - 1), h);
     }
 
-    // Drop markers (across whole song)
+    // Drop markers
     for (const drop of analysis.drops) {
+      if (drop < viewStart || drop > viewEnd) continue;
       const dx = timeToX(drop);
       ctx.strokeStyle = "rgba(255, 77, 46, 0.68)";
       ctx.lineWidth = 1.5;
@@ -204,6 +232,7 @@ export function WaveformBeatEditor({
 
     // Active beat cut markers inside window
     for (const cut of activeCuts) {
+      if (cut < viewStart || cut > viewEnd) continue;
       const cx = timeToX(cut);
       ctx.strokeStyle = "rgba(255, 176, 32, 0.9)";
       ctx.lineWidth = 1.5;
@@ -234,16 +263,28 @@ export function WaveformBeatEditor({
     ctx.fillRect(winX2 - 4, height / 2 - 14, 8, 28);
 
     // Playhead
-    const px = timeToX(playhead);
-    ctx.strokeStyle = "#22d3ee";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(px, 0);
-    ctx.lineTo(px, height);
-    ctx.stroke();
+    if (playhead >= viewStart && playhead <= viewEnd) {
+      const px = timeToX(playhead);
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(px, 0);
+      ctx.lineTo(px, height);
+      ctx.stroke();
+    }
 
     ctx.restore();
-  }, [analysis, windowStart, windowEnd, activeCuts, playhead]);
+  }, [
+    analysis,
+    windowStart,
+    windowEnd,
+    activeCuts,
+    playhead,
+    viewStart,
+    viewEnd,
+    viewSpan,
+    canvasWidthTick,
+  ]);
 
   const getTimeFromClientX = useCallback(
     (clientX: number): number => {
@@ -251,9 +292,9 @@ export function WaveformBeatEditor({
       if (!canvas) return 0;
       const rect = canvas.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      return ratio * analysis.duration;
+      return viewStart + ratio * viewSpan;
     },
-    [analysis.duration]
+    [viewStart, viewSpan]
   );
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -263,9 +304,8 @@ export function WaveformBeatEditor({
 
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
-    const dur = Math.max(0.1, analysis.duration);
-    const winX1 = (windowStart / dur) * rect.width;
-    const winX2 = (windowEnd / dur) * rect.width;
+    const winX1 = ((windowStart - viewStart) / viewSpan) * rect.width;
+    const winX2 = ((windowEnd - viewStart) / viewSpan) * rect.width;
 
     const handleTolerance = 12;
     let mode: DragMode = "none";
@@ -299,7 +339,7 @@ export function WaveformBeatEditor({
       drag.moved = true;
     }
 
-    const dt = (dx / rect.width) * analysis.duration;
+    const dt = (dx / rect.width) * viewSpan;
     const minWindow = 3.0;
 
     if (drag.mode === "start") {
@@ -400,11 +440,36 @@ export function WaveformBeatEditor({
           </button>
         </div>
 
-        <span className="font-mono text-[11px] text-[#8B8F9C]">
-          <strong className="text-[#F5F5F2]">{analysis.bpm} BPM</strong> ·{" "}
-          {selectedDuration.toFixed(1)}s ·{" "}
+        <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px] text-[#8B8F9C]">
+          <strong className="text-[#F5F5F2]">{analysis.bpm} BPM</strong>
+          {onScaleBpm && (
+            <span className="inline-flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => onScaleBpm(0.5)}
+                className="nb-key rounded-md px-1.5 py-0.5 text-[10px] font-semibold"
+                title="Halve BPM (half-time)"
+              >
+                ×½
+              </button>
+              <button
+                type="button"
+                onClick={() => onScaleBpm(2)}
+                className="nb-key rounded-md px-1.5 py-0.5 text-[10px] font-semibold"
+                title="Double BPM (double-time)"
+              >
+                ×2
+              </button>
+            </span>
+          )}
+          <span>·</span>
+          <span>
+            {formatTime(windowStart)}–{formatTime(windowEnd)} (
+            {selectedDuration.toFixed(1)}s)
+          </span>
+          <span>·</span>
           <span className="text-amber-300">{activeCuts.length + 1} cuts</span>
-        </span>
+        </div>
       </div>
 
       {/* Waveform Canvas */}
@@ -413,12 +478,12 @@ export function WaveformBeatEditor({
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
-        className={`h-20 w-full touch-none rounded-lg border border-white/10 bg-[#050608] ${
+        className={`h-24 w-full touch-none rounded-lg border border-white/10 bg-[#050608] ${
           editBeatsMode ? "cursor-crosshair" : "cursor-ew-resize"
         }`}
       />
 
-      {/* Beat Density + Window Presets + Edit Beats */}
+      {/* Beat Density + Window Presets + Zoom + Edit Beats */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-1">
           {(
@@ -458,6 +523,22 @@ export function WaveformBeatEditor({
             className="nb-key rounded-full px-2 py-1 font-mono text-[11px]"
           >
             Full
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setZoomToWindow((prev) => !prev)}
+            className={`nb-key ml-1 inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium ${
+              zoomToWindow ? "nb-key-active" : ""
+            }`}
+            title="Zoom waveform into selected window for precise beat editing"
+          >
+            {zoomToWindow ? (
+              <Minimize2 className="h-3 w-3" />
+            ) : (
+              <Maximize2 className="h-3 w-3" />
+            )}
+            <span>{zoomToWindow ? "Full" : "Zoom"}</span>
           </button>
 
           <button

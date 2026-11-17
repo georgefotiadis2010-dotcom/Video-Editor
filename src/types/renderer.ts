@@ -66,6 +66,7 @@ export interface AudioAnalysis {
   url: string;
   duration: number;
   bpm: number;
+  exactBpm: number;
   waveformPeaks: number[];
   beats: number[];
   drops: number[];

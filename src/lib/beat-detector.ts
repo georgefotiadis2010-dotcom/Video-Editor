@@ -1,7 +1,7 @@
 import type { AudioAnalysis, BeatDensity } from "@/types/renderer";
 
-const FRAME_DURATION_SEC = 0.02; // 20ms hop (~50 fps energy envelope)
-const WAVEFORM_BUCKETS = 300;
+const FRAME_DURATION_SEC = 0.01; // 10ms hop (100 fps energy envelope for tight beat lock)
+const WAVEFORM_BUCKETS = 360;
 const MIN_BPM = 70;
 const MAX_BPM = 175;
 
@@ -109,11 +109,26 @@ function computeOnsetFlux(energy: Float32Array): Float32Array {
   return flux;
 }
 
-function estimateBpm(flux: Float32Array): number {
+function computeCombinedFlux(
+  bassEnergy: Float32Array,
+  fullEnergy: Float32Array
+): Float32Array {
+  const bassFlux = computeOnsetFlux(bassEnergy);
+  const fullFlux = computeOnsetFlux(fullEnergy);
+  const len = Math.min(bassFlux.length, fullFlux.length);
+  const combined = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    combined[i] = bassFlux[i] * 0.72 + fullFlux[i] * 0.28;
+  }
+  return combined;
+}
+
+function estimateBpm(flux: Float32Array): { bpm: number; exactBpm: number } {
   const minLag = Math.round(60 / (MAX_BPM * FRAME_DURATION_SEC));
   const maxLag = Math.round(60 / (MIN_BPM * FRAME_DURATION_SEC));
   const n = flux.length;
 
+  const scores = new Float64Array(maxLag + 2);
   let bestLag = Math.round(60 / (120 * FRAME_DURATION_SEC));
   let bestScore = -1;
 
@@ -123,11 +138,12 @@ function estimateBpm(flux: Float32Array): number {
     for (let i = 0; i < limit; i++) {
       sum += flux[i] * flux[i + lag];
     }
-    // Slight preference for mid-tempo 100-140 BPM to avoid half/double-time errors
+    // Gentle prior for 95-145 BPM to reduce half/double-time ambiguity
     const bpmCandidate = 60 / (lag * FRAME_DURATION_SEC);
     const tempoPrior =
       bpmCandidate >= 95 && bpmCandidate <= 145 ? 1.12 : 1.0;
     const score = (sum / Math.max(1, limit)) * tempoPrior;
+    scores[lag] = score;
 
     if (score > bestScore) {
       bestScore = score;
@@ -135,17 +151,34 @@ function estimateBpm(flux: Float32Array): number {
     }
   }
 
-  const rawBpm = 60 / (bestLag * FRAME_DURATION_SEC);
-  return Math.round(rawBpm);
+  // Parabolic interpolation around bestLag for sub-frame fractional BPM
+  let refinedLag = bestLag;
+  if (bestLag > minLag && bestLag < maxLag) {
+    const y0 = scores[bestLag - 1];
+    const y1 = scores[bestLag];
+    const y2 = scores[bestLag + 1];
+    const denom = y0 - 2 * y1 + y2;
+    if (Math.abs(denom) > 1e-12) {
+      const delta = Math.max(-0.5, Math.min(0.5, (0.5 * (y0 - y2)) / denom));
+      refinedLag = bestLag + delta;
+    }
+  }
+
+  const exactBpm = 60 / (refinedLag * FRAME_DURATION_SEC);
+  return {
+    bpm: Math.round(exactBpm),
+    exactBpm: Number(exactBpm.toFixed(2)),
+  };
 }
 
 function detectBeatGrid(
   flux: Float32Array,
   energy: Float32Array,
-  bpm: number,
+  exactBpm: number,
   duration: number
 ): number[] {
-  const beatPeriod = 60 / Math.max(MIN_BPM, Math.min(MAX_BPM, bpm));
+  const clampedBpm = Math.max(MIN_BPM, Math.min(MAX_BPM, exactBpm));
+  const beatPeriod = 60 / clampedBpm;
   const periodFrames = beatPeriod / FRAME_DURATION_SEC;
 
   // Find best phase offset within the first beat period
@@ -161,7 +194,9 @@ function detectBeatGrid(
       const localMax = Math.max(
         flux[idx],
         flux[Math.max(0, idx - 1)],
-        flux[Math.min(flux.length - 1, idx + 1)]
+        flux[Math.min(flux.length - 1, idx + 1)],
+        flux[Math.max(0, idx - 2)],
+        flux[Math.min(flux.length - 1, idx + 2)]
       );
       score += localMax;
     }
@@ -171,9 +206,9 @@ function detectBeatGrid(
     }
   }
 
-  // Generate beats and snap slightly (+/- 40ms) to strongest nearby onset
+  // Generate beats and snap slightly (+/- 30ms) to strongest nearby onset
   const beats: number[] = [];
-  const snapRadius = 2; // +/- 40ms
+  const snapRadius = 3; // +/- 30ms at 10ms hop
   for (let k = 0; ; k++) {
     const centerIdx = Math.round(bestPhase + k * periodFrames);
     if (centerIdx >= energy.length) break;
@@ -320,7 +355,44 @@ function pickRecommendedWindow(
   return { start, end };
 }
 
-export async function analyzeAudioFile(file: File): Promise<AudioAnalysis> {
+export interface AudioAnalysisProgress {
+  ratio: number;
+  stage: string;
+}
+
+function readFileAsArrayBuffer(
+  file: File,
+  onProgress?: (ratio: number) => void
+): Promise<ArrayBuffer> {
+  if (typeof FileReader === "undefined") {
+    return file.arrayBuffer();
+  }
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onprogress = (e) => {
+      if (e.lengthComputable && e.total > 0) {
+        onProgress?.(Math.min(1, Math.max(0, e.loaded / e.total)));
+      }
+    };
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) {
+        onProgress?.(1);
+        resolve(reader.result);
+      } else {
+        reject(new Error("Failed to read audio file bytes."));
+      }
+    };
+    reader.onerror = () => {
+      reject(reader.error ?? new Error("Failed to read audio file."));
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+export async function analyzeAudioFile(
+  file: File,
+  onProgress?: (info: AudioAnalysisProgress) => void
+): Promise<AudioAnalysis> {
   const AudioCtx =
     window.AudioContext ||
     (window as unknown as { webkitAudioContext: typeof AudioContext })
@@ -330,33 +402,42 @@ export async function analyzeAudioFile(file: File): Promise<AudioAnalysis> {
     throw new Error("Web Audio API is not supported in this browser.");
   }
 
-  const arrayBuffer = await file.arrayBuffer();
+  onProgress?.({ ratio: 0.02, stage: "Reading audio file…" });
+  const arrayBuffer = await readFileAsArrayBuffer(file, (r) => {
+    onProgress?.({ ratio: 0.02 + r * 0.23, stage: "Reading audio file…" });
+  });
   const ctx = new AudioCtx();
 
   try {
+    onProgress?.({ ratio: 0.3, stage: "Decoding audio waveform…" });
     const decoded = await ctx.decodeAudioData(arrayBuffer);
     const duration = decoded.duration;
 
+    onProgress?.({ ratio: 0.55, stage: "Computing waveform & energy…" });
     const mono = mixToMono(decoded);
     const waveformPeaks = computeWaveformPeaks(mono, WAVEFORM_BUCKETS);
     const fullEnergy = computeEnergyEnvelope(mono, decoded.sampleRate);
 
+    onProgress?.({ ratio: 0.7, stage: "Extracting bass & beat drops…" });
     const bassSamples = await extractBassSamples(decoded);
     const bassEnergy = computeEnergyEnvelope(bassSamples, decoded.sampleRate);
-    const bassFlux = computeOnsetFlux(bassEnergy);
+    const combinedFlux = computeCombinedFlux(bassEnergy, fullEnergy);
 
-    const bpm = estimateBpm(bassFlux);
-    const beats = detectBeatGrid(bassFlux, bassEnergy, bpm, duration);
+    onProgress?.({ ratio: 0.85, stage: "Detecting BPM & beat grid…" });
+    const { bpm, exactBpm } = estimateBpm(combinedFlux);
+    const beats = detectBeatGrid(combinedFlux, bassEnergy, exactBpm, duration);
     const drops = detectDrops(fullEnergy, bassEnergy, beats, duration);
     const recommended = pickRecommendedWindow(fullEnergy, drops, duration);
 
     const url = URL.createObjectURL(file);
+    onProgress?.({ ratio: 1, stage: "Audio ready" });
 
     return {
       file,
       url,
       duration,
       bpm,
+      exactBpm,
       waveformPeaks,
       beats,
       drops,
@@ -400,4 +481,55 @@ export function selectCutsInWindow(
     }
   }
   return selected;
+}
+
+/**
+ * Rescales the detected beat grid by 0.5x or 2x while preserving phase lock
+ * to the track's detected drops and transients.
+ */
+export function rescaleAnalysisBpm(
+  analysis: AudioAnalysis,
+  multiplier: 0.5 | 2
+): AudioAnalysis {
+  const nextExact = Number((analysis.exactBpm * multiplier).toFixed(2));
+  const nextBpm = Math.round(nextExact);
+
+  if (nextBpm < 45 || nextBpm > 240 || analysis.beats.length < 2) {
+    return analysis;
+  }
+
+  let nextBeats: number[];
+  if (multiplier === 0.5) {
+    // Choose even or odd parity based on which aligns better with detected drops
+    let evenScore = 0;
+    let oddScore = 0;
+    for (let i = 0; i < analysis.beats.length; i++) {
+      const b = analysis.beats[i];
+      if (analysis.drops.some((d) => Math.abs(d - b) < 0.08)) {
+        if (i % 2 === 0) evenScore++;
+        else oddScore++;
+      }
+    }
+    const keepParity = oddScore > evenScore ? 1 : 0;
+    nextBeats = analysis.beats.filter((_, i) => i % 2 === keepParity);
+  } else {
+    nextBeats = [];
+    for (let i = 0; i < analysis.beats.length; i++) {
+      const curr = analysis.beats[i];
+      nextBeats.push(curr);
+      if (i + 1 < analysis.beats.length) {
+        const mid = Number(((curr + analysis.beats[i + 1]) / 2).toFixed(3));
+        if (mid - curr >= 0.18 && analysis.beats[i + 1] - mid >= 0.18) {
+          nextBeats.push(mid);
+        }
+      }
+    }
+  }
+
+  return {
+    ...analysis,
+    bpm: nextBpm,
+    exactBpm: nextExact,
+    beats: nextBeats,
+  };
 }
