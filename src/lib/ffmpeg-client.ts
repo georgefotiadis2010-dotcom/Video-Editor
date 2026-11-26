@@ -586,6 +586,50 @@ export async function cleanupBeatSyncAssets(
   await ffmpeg.deleteFile("bs_base_synced.mp4").catch(() => {});
 }
 
+function buildSegmentMotionAndEffectFilters(
+  seg: BeatCutSegment,
+  targetWidth: number,
+  targetHeight: number
+): string[] {
+  const filters: string[] = [];
+
+  if (seg.speed && Math.abs(seg.speed - 1) > 0.02) {
+    filters.push(`setpts=PTS/${seg.speed.toFixed(3)}`);
+  }
+
+  const zoom = seg.zoom ?? 1;
+  if (zoom > 1.01) {
+    const scaledW = Math.max(targetWidth, Math.round((targetWidth * zoom) / 2) * 2);
+    const scaledH = Math.max(targetHeight, Math.round((targetHeight * zoom) / 2) * 2);
+    const maxOffsetX = Math.max(0, scaledW - targetWidth);
+    const maxOffsetY = Math.max(0, scaledH - targetHeight);
+    const panX = Math.max(-1, Math.min(1, seg.panX ?? 0));
+    const panY = Math.max(-1, Math.min(1, seg.panY ?? 0));
+    const cropX = Math.round(((panX + 1) / 2) * maxOffsetX);
+    const cropY = Math.round(((panY + 1) / 2) * maxOffsetY);
+    filters.push(
+      `scale=${scaledW}:${scaledH}:flags=lanczos`,
+      `crop=${targetWidth}:${targetHeight}:${cropX}:${cropY}`
+    );
+  }
+
+  if (seg.effect === "rgb-glitch") {
+    filters.push("rgbashift=rh=4:bh=-4:enable='lt(t,0.12)'");
+  } else if (seg.effect === "vhs-tape") {
+    filters.push("noise=alls=14:allf=t+u");
+  } else if (seg.effect === "halation-bloom") {
+    filters.push("gblur=sigma=0.6");
+  } else if (seg.effect === "dim-backdrop") {
+    filters.push("eq=brightness=-0.12:contrast=1.08");
+  }
+
+  if (seg.transitionFlash) {
+    filters.push("eq=brightness=0.28:enable='lt(t,0.08)'");
+  }
+
+  return filters;
+}
+
 async function renderCutSegments(
   ffmpeg: FFmpegInstance,
   segments: BeatCutSegment[],
@@ -603,7 +647,7 @@ async function renderCutSegments(
   const clipDurationMap = new Map(clips.map((c) => [c.id, c.duration]));
   const segNames: string[] = [];
 
-  const vfFilter = buildFFmpegVideoChain({
+  const baseVfFilter = buildFFmpegVideoChain({
     aspectMode,
     targetWidth: width,
     targetHeight: height,
@@ -618,6 +662,12 @@ async function renderCutSegments(
     if (!srcName) {
       throw new Error(`Missing source clip in virtual FS for ${seg.clipName}`);
     }
+
+    const segFilters = buildSegmentMotionAndEffectFilters(seg, width, height);
+    const vfFilter =
+      segFilters.length > 0
+        ? `${baseVfFilter},${segFilters.join(",")}`
+        : baseVfFilter;
 
     const segOut = `bs_seg_${i}.mp4`;
     const clipDur = clipDurationMap.get(seg.clipId) ?? seg.duration;
@@ -970,4 +1020,214 @@ export async function renderSingleBeatSyncedReel({
       await ffmpeg.deleteFile(outName).catch(() => {});
     }
   }
+}
+
+const PREVIEW_MOUNT_DIR = "/input_preview";
+let previewTaskQueue: Promise<unknown> = Promise.resolve();
+let previewGeneration = 0;
+
+export function cancelPendingPreviewTasks(): void {
+  previewGeneration += 1;
+}
+
+export async function waitForIdlePreviewQueue(): Promise<void> {
+  cancelPendingPreviewTasks();
+  await previewTaskQueue.catch(() => {});
+}
+
+function enqueuePreviewTask<T>(task: () => Promise<T>): Promise<T> {
+  const gen = previewGeneration;
+  const run = previewTaskQueue.then(async () => {
+    if (gen !== previewGeneration) {
+      throw new Error("Preview task cancelled.");
+    }
+    return task();
+  });
+  previewTaskQueue = run.catch(() => {});
+  return run;
+}
+
+function parseVideoMetaFromLogs(logs: string[]): {
+  width?: number;
+  height?: number;
+  duration?: number;
+} {
+  let width: number | undefined;
+  let height: number | undefined;
+  let duration: number | undefined;
+
+  for (const line of logs) {
+    if (duration === undefined) {
+      const durMatch = line.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (durMatch) {
+        const hrs = Number(durMatch[1]);
+        const mins = Number(durMatch[2]);
+        const secs = Number(durMatch[3]);
+        const total = hrs * 3600 + mins * 60 + secs;
+        if (Number.isFinite(total) && total > 0) {
+          duration = total;
+        }
+      }
+    }
+    if (width === undefined && /Video:/.test(line)) {
+      const dimMatch = line.match(/,\s*(\d{2,5})x(\d{2,5})(?:[\s,\[]|$)/);
+      if (dimMatch) {
+        const w = Number(dimMatch[1]);
+        const h = Number(dimMatch[2]);
+        if (w > 0 && h > 0) {
+          width = w;
+          height = h;
+        }
+      }
+    }
+  }
+
+  return { width, height, duration };
+}
+
+function sanitizeInputFilename(name: string, fallbackExt: string): string {
+  const base = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return base || `input.${fallbackExt}`;
+}
+
+export async function extractVideoThumbnailAndMetaWithFFmpeg(
+  file: File
+): Promise<{
+  thumbnailUrl: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+}> {
+  return enqueuePreviewTask(async () => {
+    const ffmpeg = await getFFmpeg();
+    const fsName = sanitizeInputFilename(file.name, "mov");
+    const outThumb = `preview_thumb_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.jpg`;
+    const logs: string[] = [];
+    const logHandler = ({ message }: FFmpegLogEvent) => {
+      logs.push(message);
+    };
+
+    ffmpeg.on("log", logHandler);
+    try {
+      const mounted = await mountInputBlobs(ffmpeg, PREVIEW_MOUNT_DIR, [
+        { fsName, file },
+      ]);
+      const inputPath = mounted.paths.get(fsName) ?? fsName;
+
+      let exitCode = await ffmpeg.exec([
+        "-ss",
+        "0.5",
+        "-i",
+        inputPath,
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale='min(360,iw)':-2",
+        "-q:v",
+        "4",
+        "-y",
+        outThumb,
+      ]);
+
+      let data: Uint8Array | string | null = null;
+      if (exitCode === 0) {
+        data = await ffmpeg.readFile(outThumb).catch(() => null);
+      }
+
+      if (!data || (data instanceof Uint8Array && data.byteLength === 0)) {
+        exitCode = await ffmpeg.exec([
+          "-ss",
+          "0",
+          "-i",
+          inputPath,
+          "-frames:v",
+          "1",
+          "-vf",
+          "scale='min(360,iw)':-2",
+          "-q:v",
+          "4",
+          "-y",
+          outThumb,
+        ]);
+        if (exitCode !== 0) {
+          throw new Error(`FFmpeg thumbnail extraction failed (exit ${exitCode})`);
+        }
+        data = await ffmpeg.readFile(outThumb);
+      }
+
+      const uint8 =
+        data instanceof Uint8Array ? data : new TextEncoder().encode(data);
+      const copy = new Uint8Array(uint8.byteLength);
+      copy.set(uint8);
+
+      const blob = new Blob([copy.buffer], { type: "image/jpeg" });
+      const thumbnailUrl = URL.createObjectURL(blob);
+      const meta = parseVideoMetaFromLogs(logs);
+
+      return { thumbnailUrl, ...meta };
+    } finally {
+      ffmpeg.off("log", logHandler);
+      await unmountInputDir(ffmpeg, PREVIEW_MOUNT_DIR, [fsName]);
+      if (ffmpeg.loaded) {
+        await ffmpeg.deleteFile(outThumb).catch(() => {});
+      }
+    }
+  });
+}
+
+export async function generatePreviewProxyWithFFmpeg(
+  file: File
+): Promise<string> {
+  return enqueuePreviewTask(async () => {
+    const ffmpeg = await getFFmpeg();
+    const fsName = sanitizeInputFilename(file.name, "mov");
+    const outProxy = `preview_proxy_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp4`;
+
+    try {
+      const mounted = await mountInputBlobs(ffmpeg, PREVIEW_MOUNT_DIR, [
+        { fsName, file },
+      ]);
+      const inputPath = mounted.paths.get(fsName) ?? fsName;
+
+      const exitCode = await ffmpeg.exec([
+        "-i",
+        inputPath,
+        "-vf",
+        "scale='min(480,iw)':-2",
+        "-r",
+        "24",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "28",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-y",
+        outProxy,
+      ]);
+
+      if (exitCode !== 0) {
+        throw new Error(`FFmpeg preview proxy failed (exit ${exitCode})`);
+      }
+
+      const data = await ffmpeg.readFile(outProxy);
+      const uint8 =
+        data instanceof Uint8Array ? data : new TextEncoder().encode(data);
+      const copy = new Uint8Array(uint8.byteLength);
+      copy.set(uint8);
+
+      const blob = new Blob([copy.buffer], { type: "video/mp4" });
+      return URL.createObjectURL(blob);
+    } finally {
+      await unmountInputDir(ffmpeg, PREVIEW_MOUNT_DIR, [fsName]);
+      if (ffmpeg.loaded) {
+        await ffmpeg.deleteFile(outProxy).catch(() => {});
+      }
+    }
+  });
 }

@@ -1,4 +1,13 @@
-import type { BeatCutSegment, SourceClipItem } from "@/types/renderer";
+import type {
+  BeatCutSegment,
+  EditStylePreset,
+  SourceClipItem,
+} from "@/types/renderer";
+
+export interface BeatCutPlanOptions {
+  editStyle?: EditStylePreset | null;
+  drops?: number[];
+}
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -16,7 +25,8 @@ export function buildBeatCutPlan(
   windowStart: number,
   windowEnd: number,
   clips: SourceClipItem[],
-  shuffleSeed?: number
+  shuffleSeed?: number,
+  options?: BeatCutPlanOptions
 ): BeatCutSegment[] {
   if (clips.length === 0 || windowEnd <= windowStart + 0.25) {
     return [];
@@ -89,15 +99,105 @@ export function buildBeatCutPlan(
 
     // Choose a smart sourceStart inside the raw clip
     let sourceStart = 0;
+    const isSingleClip = clips.length === 1;
+    const style = options?.editStyle ?? null;
+    const isChronological =
+      isSingleClip &&
+      (style?.pacing === "single-take" ||
+        style?.pacing === "two-act" ||
+        style?.id === "car-performance" ||
+        style?.id === "raw-acoustic");
+
     const usableSpan = Math.max(0, clip.duration - duration - 0.15);
     if (usableSpan > 0.3) {
-      if (rng) {
+      if (isChronological) {
+        // Walk forward chronologically through the single take
+        const progress = points.length > 2 ? i / (points.length - 2) : 0;
+        sourceStart = Number((0.1 + progress * usableSpan).toFixed(2));
+      } else if (rng) {
         sourceStart = Number((0.1 + rng() * usableSpan).toFixed(2));
       } else {
         // Evenly step through the raw video on repeated uses
         const stepOffset = ((uses * 0.37) % 1) * usableSpan;
         sourceStart = Number((0.1 + stepOffset).toFixed(2));
       }
+    }
+
+    // Compute per-segment motion & effect based on editStyle and single-clip vs multi-clip
+    let zoom = 1;
+    let panX = 0;
+    let panY = 0;
+    let speed = 1;
+    let effect = style?.effect ?? "none";
+    let transitionFlash = false;
+
+    const totalSegs = Math.max(1, points.length - 1);
+    const isDrop =
+      options?.drops?.some((d) => Math.abs(d - startTime) < 0.25) ?? false;
+    const isActOne =
+      style?.pacing === "two-act" && i < Math.max(1, Math.floor(totalSegs * 0.3));
+
+    if (style) {
+      if (isActOne) {
+        // Act 1 of storytime-drop / demo-vs-master: raw wide framing, no heavy VFX
+        zoom = 1;
+        effect = "none";
+      } else {
+        if (style.pacing === "two-act" && i === Math.max(1, Math.floor(totalSegs * 0.3))) {
+          transitionFlash = true;
+        }
+
+        switch (style.motion) {
+          case "punch-zoom": {
+            const zoomCycle = isSingleClip ? [1.0, 1.22, 1.12, 1.32] : [1.0, 1.14, 1.06];
+            zoom = zoomCycle[i % zoomCycle.length];
+            if (isSingleClip && zoom > 1.05) {
+              panX = i % 2 === 0 ? 0.25 : -0.25;
+              panY = i % 3 === 0 ? -0.15 : 0.1;
+            }
+            break;
+          }
+          case "slow-push": {
+            const step = (i % 4) * 0.03;
+            zoom = Number((1.02 + step).toFixed(2));
+            break;
+          }
+          case "beat-pulse": {
+            zoom = i % 2 === 0 ? 1.0 : isSingleClip ? 1.16 : 1.08;
+            break;
+          }
+          case "whip-pan": {
+            zoom = 1.14;
+            panX = i % 2 === 0 ? -0.45 : 0.45;
+            break;
+          }
+          case "handheld": {
+            zoom = isSingleClip ? 1.1 : 1.05;
+            panX = ((i % 3) - 1) * 0.2;
+            panY = (((i + 1) % 3) - 1) * 0.15;
+            break;
+          }
+          case "slow-mo": {
+            speed = 0.65;
+            zoom = isSingleClip ? 1.06 + (i % 2) * 0.06 : 1.03;
+            break;
+          }
+          default:
+            if (isSingleClip) {
+              // Subtle virtual cut reframing even when motion is "none"
+              zoom = i % 2 === 0 ? 1.0 : 1.12;
+            }
+            break;
+        }
+
+        if (isDrop || (style.effect === "flash-drop" && i > 0 && i % 4 === 0)) {
+          transitionFlash = true;
+        }
+      }
+    } else if (isSingleClip) {
+      // Default single-clip virtual cut: subtle alternating punch-in so 1 clip feels dynamic
+      zoom = i % 2 === 0 ? 1.0 : 1.12;
+      panX = i % 2 === 0 ? 0 : (i % 4 === 1 ? 0.2 : -0.2);
     }
 
     segments.push({
@@ -108,6 +208,12 @@ export function buildBeatCutPlan(
       clipId: clip.id,
       clipName: clip.file.name,
       sourceStart,
+      zoom,
+      panX,
+      panY,
+      speed,
+      effect,
+      transitionFlash,
     });
   }
 

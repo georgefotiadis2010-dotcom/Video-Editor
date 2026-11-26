@@ -30,15 +30,23 @@ import {
   DEFAULT_VIDEO_FILTER,
 } from "@/lib/video-effects";
 import {
+  cancelPendingPreviewTasks,
   cleanupSourceFile,
+  extractVideoThumbnailAndMetaWithFFmpeg,
   formatFFmpegError,
+  generatePreviewProxyWithFFmpeg,
   getFFmpeg,
   isFFmpegLoaded,
   prepareSingleLoopBase,
   renderHookOnSingleLoopBase,
   renderSingleHookVideo,
   resetFFmpeg,
+  waitForIdlePreviewQueue,
 } from "@/lib/ffmpeg-client";
+import {
+  probeVideoMetadata,
+  revokeVideoMetadataUrls,
+} from "@/lib/video-probe";
 import {
   DEFAULT_TEXT_STYLE,
   renderHookOverlayPng,
@@ -48,6 +56,7 @@ import {
 } from "@/lib/text-overlay";
 import type {
   AspectMode,
+  EditStyleId,
   EditorMode,
   FontFamilyOption,
   PillStyleOption,
@@ -105,6 +114,7 @@ export function BatchRendererApp() {
     useState<TextStyleConfig>(DEFAULT_TEXT_STYLE);
   const [videoFilter, setVideoFilter] =
     useState<VideoFilterConfig>(DEFAULT_VIDEO_FILTER);
+  const [editStyle, setEditStyle] = useState<EditStyleId | undefined>(undefined);
   const [videoCrop, setVideoCrop] =
     useState<VideoCropRect>(DEFAULT_VIDEO_CROP);
   const [aspectMode, setAspectMode] = useState<AspectMode>("force-9x16");
@@ -176,49 +186,75 @@ export function BatchRendererApp() {
     setPreviewClip(null);
   }, []);
 
-  const handleVideoFile = useCallback((file: File) => {
-    if (!file.type.startsWith("video/")) {
+  const handleVideoFile = useCallback(async (file: File) => {
+    if (
+      !file.type.startsWith("video/") &&
+      !/\.(mp4|mov|webm|m4v)$/i.test(file.name)
+    ) {
       setErrorMessage("Please select a valid video file (.mp4, .mov, .webm).");
       return;
     }
 
+    cancelPendingPreviewTasks();
     setErrorMessage(null);
     setUploadingVideoName(file.name);
-    const objectUrl = URL.createObjectURL(file);
-    const probe = document.createElement("video");
-    probe.preload = "metadata";
-    probe.src = objectUrl;
 
-    probe.onloadedmetadata = () => {
-      const nextWidth = probe.videoWidth || 1080;
-      const nextHeight = probe.videoHeight || 1920;
-      const nextDuration = probe.duration || 0;
-      probe.removeAttribute("src");
-      probe.load();
-
+    try {
+      const meta = await probeVideoMetadata(file);
+      const initial: VideoMetadata = {
+        ...meta,
+        isGeneratingProxy: meta.browserPlayable === false,
+      };
       setUploadingVideoName(null);
       setVideo((prev) => {
-        if (prev?.url) URL.revokeObjectURL(prev.url);
-        return {
-          file,
-          url: objectUrl,
-          width: nextWidth,
-          height: nextHeight,
-          duration: nextDuration,
-          sizeBytes: file.size,
-        };
+        revokeVideoMetadataUrls(prev);
+        return initial;
       });
-    };
 
-    probe.onerror = () => {
-      probe.removeAttribute("src");
-      probe.load();
+      if (meta.browserPlayable === false) {
+        try {
+          const { thumbnailUrl, width, height, duration } =
+            await extractVideoThumbnailAndMetaWithFFmpeg(file);
+          setVideo((prev) => {
+            if (!prev || prev.url !== initial.url) {
+              URL.revokeObjectURL(thumbnailUrl);
+              return prev;
+            }
+            return {
+              ...prev,
+              thumbnailUrl,
+              width: width ?? prev.width,
+              height: height ?? prev.height,
+              duration: duration ?? prev.duration,
+            };
+          });
+        } catch {
+          // Ignore if cancelled
+        }
+
+        try {
+          const previewUrl = await generatePreviewProxyWithFFmpeg(file);
+          setVideo((prev) => {
+            if (!prev || prev.url !== initial.url) {
+              URL.revokeObjectURL(previewUrl);
+              return prev;
+            }
+            return { ...prev, previewUrl, isGeneratingProxy: false };
+          });
+        } catch {
+          setVideo((prev) =>
+            prev && prev.url === initial.url
+              ? { ...prev, isGeneratingProxy: false }
+              : prev
+          );
+        }
+      }
+    } catch {
       setUploadingVideoName(null);
-      URL.revokeObjectURL(objectUrl);
       setErrorMessage(
         "Could not read video metadata. Try an H.264 MP4 or MOV file."
       );
-    };
+    }
   }, []);
 
   const handleDrop = useCallback(
@@ -274,6 +310,7 @@ export function BatchRendererApp() {
         : Math.max(2, Math.floor(video.height / 2) * 2);
 
     try {
+      await waitForIdlePreviewQueue();
       const ffmpeg = await getFFmpeg();
       if (cancelRequestedRef.current) {
         setPhase("cancelled");
@@ -546,7 +583,8 @@ export function BatchRendererApp() {
                     type="button"
                     disabled={isBusy}
                     onClick={() => {
-                      URL.revokeObjectURL(video.url);
+                      cancelPendingPreviewTasks();
+                      revokeVideoMetadataUrls(video);
                       setVideo(null);
                     }}
                     className="nb-key inline-flex items-center gap-1 rounded-xl px-2.5 py-1 text-xs font-semibold text-[#9A9DA8] hover:text-[#FF4D2E]"
@@ -1088,6 +1126,8 @@ export function BatchRendererApp() {
                 onChangeFilter={setVideoFilter}
                 videoCrop={videoCrop}
                 onChangeCrop={setVideoCrop}
+                editStyle={editStyle}
+                onChangeEditStyle={setEditStyle}
                 disabled={isBusy}
               />
             </section>

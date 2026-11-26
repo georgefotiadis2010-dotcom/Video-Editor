@@ -1,21 +1,29 @@
 "use client";
 
 import { useState } from "react";
-import { ChevronDown, ChevronUp, Crop, RotateCcw, Sparkles } from "lucide-react";
+import { ChevronDown, ChevronUp, Crop, Film, RotateCcw, Sparkles } from "lucide-react";
 import {
   DEFAULT_VIDEO_CROP,
   DEFAULT_VIDEO_FILTER,
+  EDIT_STYLE_PRESETS,
+  getEditStylePreset,
   isCropActive,
   isFilterActive,
   VIDEO_FILTER_PRESETS,
 } from "@/lib/video-effects";
-import type { VideoCropRect, VideoFilterConfig } from "@/types/renderer";
+import type {
+  EditStyleId,
+  VideoCropRect,
+  VideoFilterConfig,
+} from "@/types/renderer";
 
 interface VideoEffectsPanelProps {
   videoFilter: VideoFilterConfig;
   onChangeFilter: (next: VideoFilterConfig) => void;
   videoCrop: VideoCropRect;
   onChangeCrop: (next: VideoCropRect) => void;
+  editStyle?: EditStyleId;
+  onChangeEditStyle?: (next: EditStyleId) => void;
   disabled?: boolean;
 }
 
@@ -24,14 +32,100 @@ export function VideoEffectsPanel({
   onChangeFilter,
   videoCrop,
   onChangeCrop,
+  editStyle,
+  onChangeEditStyle,
   disabled = false,
 }: VideoEffectsPanelProps) {
   const [showSliders, setShowSliders] = useState(false);
+  const [showAllStyles, setShowAllStyles] = useState(false);
   const filterModified = isFilterActive(videoFilter);
   const cropModified = isCropActive(videoCrop);
+  const activeStyle = editStyle ? getEditStylePreset(editStyle) : null;
+  const visibleStyles = showAllStyles
+    ? EDIT_STYLE_PRESETS
+    : EDIT_STYLE_PRESETS.slice(0, 6);
+
+  const handleSelectEditStyle = (styleId: EditStyleId) => {
+    onChangeEditStyle?.(styleId);
+    const preset = getEditStylePreset(styleId);
+    const matchedFilter = VIDEO_FILTER_PRESETS.find(
+      (f) => f.id === preset.filterPreset
+    );
+    if (matchedFilter) {
+      onChangeFilter({ ...matchedFilter.config });
+    }
+  };
 
   return (
     <div className="mt-4 border-t border-white/10 pt-3.5">
+      {onChangeEditStyle && (
+        <div className="mb-4 border-b border-white/10 pb-3.5">
+          <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Film className="h-3.5 w-3.5 text-[#FF4D2E]" />
+              <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]">
+                Music Promo Edit Style
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => setShowAllStyles((v) => !v)}
+              className="nb-key inline-flex items-center gap-1 rounded-lg px-2 py-0.5 font-mono text-[10px] font-semibold text-[#C4C7D0]"
+            >
+              <span>{showAllStyles ? "Show Less" : `All ${EDIT_STYLE_PRESETS.length} Styles`}</span>
+              {showAllStyles ? (
+                <ChevronUp className="h-3 w-3" />
+              ) : (
+                <ChevronDown className="h-3 w-3" />
+              )}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {visibleStyles.map((style) => {
+              const active = editStyle === style.id;
+              return (
+                <button
+                  key={style.id}
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => handleSelectEditStyle(style.id)}
+                  className={`nb-key flex flex-col items-start gap-1.5 rounded-xl p-2 text-left ${
+                    active ? "nb-key-active" : ""
+                  }`}
+                >
+                  <div
+                    className="h-2.5 w-full rounded-md border border-white/15"
+                    style={{ background: style.swatch }}
+                  />
+                  <div className="min-w-0 w-full">
+                    <p className="truncate text-[11px] font-bold leading-tight text-[#F5F5F2]">
+                      {style.label}
+                    </p>
+                    <p
+                      className={`truncate font-mono text-[9px] uppercase tracking-wider ${
+                        active ? "text-white/85" : "text-[#8B8F9C]"
+                      }`}
+                    >
+                      {style.badge}
+                    </p>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {activeStyle && (
+            <div className="nb-well mt-2.5 rounded-xl px-3 py-2 text-[11px] text-[#C4C7D0]">
+              <p className="font-medium text-[#F5F5F2]">{activeStyle.description}</p>
+              <p className="mt-1 font-mono text-[10px] text-[#8B8F9C]">
+                1-Clip: {activeStyle.singleClipStrategy} · Multi-Clip: {activeStyle.multiClipStrategy}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
       <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <Sparkles className="h-3.5 w-3.5 text-[#FF4D2E]" />

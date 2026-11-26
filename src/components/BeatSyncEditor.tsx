@@ -28,6 +28,7 @@ import { WaveformBeatEditor } from "@/components/WaveformBeatEditor";
 import {
   DEFAULT_VIDEO_CROP,
   DEFAULT_VIDEO_FILTER,
+  getEditStylePreset,
 } from "@/lib/video-effects";
 import {
   analyzeAudioFile,
@@ -37,15 +38,23 @@ import {
 import { buildBeatCutPlan } from "@/lib/beat-planner";
 import {
   buildBeatSyncedBaseVideo,
+  cancelPendingPreviewTasks,
   cleanupBeatSyncAssets,
+  extractVideoThumbnailAndMetaWithFFmpeg,
   formatFFmpegError,
+  generatePreviewProxyWithFFmpeg,
   getFFmpeg,
   isFFmpegLoaded,
   prepareBeatSyncAssets,
   renderHookOnSyncedBase,
   renderSingleBeatSyncedReel,
   resetFFmpeg,
+  waitForIdlePreviewQueue,
 } from "@/lib/ffmpeg-client";
+import {
+  probeVideoMetadata,
+  revokeVideoMetadataUrls,
+} from "@/lib/video-probe";
 import {
   DEFAULT_TEXT_STYLE,
   renderHookOverlayPng,
@@ -55,6 +64,7 @@ import {
 } from "@/lib/text-overlay";
 import type {
   AspectMode,
+  EditStyleId,
   AudioAnalysis,
   BeatDensity,
   ClipArrangementMode,
@@ -88,37 +98,6 @@ function triggerDownload(url: string, filename: string) {
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
-}
-
-function probeVideoFile(file: File): Promise<SourceClipItem> {
-  return new Promise((resolve, reject) => {
-    const objectUrl = URL.createObjectURL(file);
-    const probe = document.createElement("video");
-    probe.preload = "metadata";
-    probe.src = objectUrl;
-
-    probe.onloadedmetadata = () => {
-      const item: SourceClipItem = {
-        id: `${file.name}-${file.size}-${Math.random().toString(36).slice(2, 8)}`,
-        file,
-        url: objectUrl,
-        width: probe.videoWidth || 1080,
-        height: probe.videoHeight || 1920,
-        duration: probe.duration || 1,
-        sizeBytes: file.size,
-      };
-      probe.removeAttribute("src");
-      probe.load();
-      resolve(item);
-    };
-
-    probe.onerror = () => {
-      probe.removeAttribute("src");
-      probe.load();
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error(`Could not read video metadata for ${file.name}`));
-    };
-  });
 }
 
 function SectionLabel({
@@ -191,6 +170,11 @@ export function BeatSyncEditor() {
     useState<TextStyleConfig>(DEFAULT_TEXT_STYLE);
   const [videoFilter, setVideoFilter] =
     useState<VideoFilterConfig>(DEFAULT_VIDEO_FILTER);
+  const [editStyle, setEditStyle] = useState<EditStyleId | undefined>(undefined);
+  const activeEditStylePreset = useMemo(
+    () => getEditStylePreset(editStyle),
+    [editStyle]
+  );
   const [videoCrop, setVideoCrop] =
     useState<VideoCropRect>(DEFAULT_VIDEO_CROP);
   const [aspectMode, setAspectMode] = useState<AspectMode>("force-9x16");
@@ -244,11 +228,12 @@ export function BeatSyncEditor() {
 
   useEffect(() => {
     return () => {
+      cancelPendingPreviewTasks();
       for (const clip of renderedRef.current) {
         URL.revokeObjectURL(clip.url);
       }
       for (const src of clipsRef.current) {
-        URL.revokeObjectURL(src.url);
+        revokeVideoMetadataUrls(src);
       }
     };
   }, []);
@@ -291,8 +276,11 @@ export function BeatSyncEditor() {
 
   const previewPlan = useMemo(() => {
     if (!audioAnalysis || clips.length === 0) return [];
-    return buildBeatCutPlan(activeCuts, windowStart, windowEnd, clips);
-  }, [audioAnalysis, activeCuts, windowStart, windowEnd, clips]);
+    return buildBeatCutPlan(activeCuts, windowStart, windowEnd, clips, undefined, {
+      editStyle: activeEditStylePreset,
+      drops: audioAnalysis.drops,
+    });
+  }, [audioAnalysis, activeCuts, windowStart, windowEnd, clips, activeEditStylePreset]);
 
   const beatSyncPreview = useMemo(() => {
     if (!audioAnalysis || previewPlan.length === 0) return null;
@@ -376,6 +364,8 @@ export function BeatSyncEditor() {
       fileName: files[0].name,
     });
 
+    const unplayableItems: SourceClipItem[] = [];
+
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
@@ -385,9 +375,18 @@ export function BeatSyncEditor() {
           fileName: file.name,
         });
         try {
-          const item = await probeVideoFile(file);
+          const meta = await probeVideoMetadata(file);
+          const item: SourceClipItem = {
+            ...meta,
+            duration: meta.duration || 1,
+            id: `${file.name}-${file.size}-${Math.random().toString(36).slice(2, 8)}`,
+            isGeneratingProxy: meta.browserPlayable === false,
+          };
           loadedCount += 1;
           setClips((prev) => [...prev, item]);
+          if (item.browserPlayable === false) {
+            unplayableItems.push(item);
+          }
         } catch {
           // Skip unreadable clip and continue
         }
@@ -404,19 +403,77 @@ export function BeatSyncEditor() {
     } finally {
       setClipUploadProgress(null);
     }
+
+    // For clips the browser cannot decode natively (e.g. .mov ProRes / 10-bit),
+    // extract thumbnails + real dimensions first, then generate lightweight MP4 preview proxies.
+    if (unplayableItems.length > 0) {
+      void (async () => {
+        for (const target of unplayableItems) {
+          if (!clipsRef.current.some((c) => c.id === target.id)) continue;
+          try {
+            const { thumbnailUrl, width, height, duration } =
+              await extractVideoThumbnailAndMetaWithFFmpeg(target.file);
+            if (!clipsRef.current.some((c) => c.id === target.id)) {
+              URL.revokeObjectURL(thumbnailUrl);
+              continue;
+            }
+            setClips((prev) =>
+              prev.map((c) =>
+                c.id === target.id
+                  ? {
+                      ...c,
+                      thumbnailUrl,
+                      width: width ?? c.width,
+                      height: height ?? c.height,
+                      duration: duration ?? c.duration,
+                    }
+                  : c
+              )
+            );
+          } catch {
+            // Keep going if thumbnail extraction fails or was cancelled
+          }
+        }
+
+        for (const target of unplayableItems) {
+          if (!clipsRef.current.some((c) => c.id === target.id)) continue;
+          try {
+            const previewUrl = await generatePreviewProxyWithFFmpeg(target.file);
+            if (!clipsRef.current.some((c) => c.id === target.id)) {
+              URL.revokeObjectURL(previewUrl);
+              continue;
+            }
+            setClips((prev) =>
+              prev.map((c) =>
+                c.id === target.id
+                  ? { ...c, previewUrl, isGeneratingProxy: false }
+                  : c
+              )
+            );
+          } catch {
+            setClips((prev) =>
+              prev.map((c) =>
+                c.id === target.id ? { ...c, isGeneratingProxy: false } : c
+              )
+            );
+          }
+        }
+      })();
+    }
   }, []);
 
   const handleRemoveClip = (id: string) => {
     setClips((prev) => {
       const target = prev.find((c) => c.id === id);
-      if (target) URL.revokeObjectURL(target.url);
+      revokeVideoMetadataUrls(target);
       return prev.filter((c) => c.id !== id);
     });
   };
 
   const handleClearClips = () => {
+    cancelPendingPreviewTasks();
     setClips((prev) => {
-      for (const c of prev) URL.revokeObjectURL(c.url);
+      for (const c of prev) revokeVideoMetadataUrls(c);
       return [];
     });
   };
@@ -470,6 +527,7 @@ export function BeatSyncEditor() {
         : Math.max(2, Math.floor(firstClip.height / 2) * 2);
 
     try {
+      await waitForIdlePreviewQueue();
       const ffmpeg = await getFFmpeg();
       if (cancelRequestedRef.current) {
         setPhase("cancelled");
@@ -502,7 +560,12 @@ export function BeatSyncEditor() {
             activeCuts,
             windowStart,
             windowEnd,
-            clips
+            clips,
+            undefined,
+            {
+              editStyle: activeEditStylePreset,
+              drops: audioAnalysis.drops,
+            }
           );
           if (basePlan.length === 0) {
             throw new Error("No valid beat segments in the selected window.");
@@ -572,7 +635,11 @@ export function BeatSyncEditor() {
               windowStart,
               windowEnd,
               clips,
-              seed
+              seed,
+              {
+                editStyle: activeEditStylePreset,
+                drops: audioAnalysis.drops,
+              }
             );
             if (plan.length === 0) {
               throw new Error("No valid beat segments in the selected window.");
@@ -1039,25 +1106,38 @@ export function BeatSyncEditor() {
                       }`}
                     >
                       <div className="relative aspect-[9/12] w-full bg-black">
-                        <video
-                          src={clip.url}
-                          muted
-                          loop
-                          playsInline
-                          preload="metadata"
-                          disablePictureInPicture
-                          disableRemotePlayback
-                          onMouseEnter={(e) => {
-                            if (!isBusy) {
-                              e.currentTarget.play().catch(() => {});
-                            }
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.pause();
-                            e.currentTarget.currentTime = 0;
-                          }}
-                          className="h-full w-full object-cover"
-                        />
+                        {clip.previewUrl || clip.browserPlayable !== false ? (
+                          <video
+                            src={clip.previewUrl ?? clip.url}
+                            poster={clip.thumbnailUrl}
+                            muted
+                            loop
+                            playsInline
+                            preload="metadata"
+                            disablePictureInPicture
+                            disableRemotePlayback
+                            onMouseEnter={(e) => {
+                              if (!isBusy) {
+                                e.currentTarget.play().catch(() => {});
+                              }
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.pause();
+                              e.currentTarget.currentTime = 0;
+                            }}
+                            className="h-full w-full object-cover"
+                          />
+                        ) : clip.thumbnailUrl ? (
+                          <img
+                            src={clip.thumbnailUrl}
+                            alt={clip.file.name}
+                            className="h-full w-full object-cover"
+                          />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center">
+                            <Loader2 className="h-4 w-4 animate-spin text-[#8B8F9C]" />
+                          </div>
+                        )}
                         <span className="absolute left-2 top-2 rounded-lg border border-white/15 bg-black/80 px-2 py-0.5 font-mono text-[10px] font-bold text-[#F5F5F2] backdrop-blur-sm">
                           #{idx + 1}
                         </span>
@@ -1526,6 +1606,8 @@ export function BeatSyncEditor() {
                   onChangeFilter={setVideoFilter}
                   videoCrop={videoCrop}
                   onChangeCrop={setVideoCrop}
+                  editStyle={editStyle}
+                  onChangeEditStyle={setEditStyle}
                   disabled={isBusy}
                 />
               </div>

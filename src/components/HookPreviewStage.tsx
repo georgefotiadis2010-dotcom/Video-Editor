@@ -84,7 +84,10 @@ export function HookPreviewStage({
     null
   );
   const [activeSegLabel, setActiveSegLabel] = useState<string | null>(null);
-  const [videoDecodeError, setVideoDecodeError] = useState<string | null>(null);
+  const [decodeErrorState, setDecodeErrorState] = useState<{
+    url: string;
+    message: string;
+  } | null>(null);
 
   const activeCrop = videoCrop ?? DEFAULT_VIDEO_CROP;
   const cropEnabled = isCropActive(activeCrop);
@@ -96,16 +99,22 @@ export function HookPreviewStage({
   );
   const effectiveBeatPlaying = isBeatPlaying && canBeatPreview;
 
-  // Reset decode error when video changes
-  useEffect(() => {
-    setVideoDecodeError(null);
-  }, [video?.url]);
+  const displayVideoUrl = video
+    ? (video.previewUrl ?? (video.browserPlayable === false ? null : video.url))
+    : null;
+
+  const videoDecodeError =
+    decodeErrorState && decodeErrorState.url === displayVideoUrl
+      ? decodeErrorState.message
+      : null;
 
   const clipInfoMap = useMemo(() => {
     const map = new Map<string, { url: string; duration: number }>();
     if (beatSyncPreview) {
       for (const c of beatSyncPreview.clips) {
-        map.set(c.id, { url: c.url, duration: c.duration });
+        const playableUrl =
+          c.previewUrl ?? (c.browserPlayable === false ? "" : c.url);
+        map.set(c.id, { url: playableUrl, duration: c.duration });
       }
     }
     return map;
@@ -297,7 +306,6 @@ export function HookPreviewStage({
 
   const aspectRatioCss = `${targetWidth} / ${targetHeight}`;
   const fitClass = aspectMode === "force-9x16" ? "object-cover" : "object-contain";
-  const displayVideoUrl = video?.url ?? null;
 
   const cssFilter = buildPreviewCssFilter(videoFilter);
 
@@ -488,6 +496,25 @@ export function HookPreviewStage({
                     activePreviewClipId === clip.id ||
                     (!activePreviewClipId &&
                       clip.id === beatSyncPreview.segments[0]?.clipId);
+                  const clipPlayableUrl =
+                    clip.previewUrl ??
+                    (clip.browserPlayable === false ? undefined : clip.url);
+
+                  if (!clipPlayableUrl && clip.thumbnailUrl) {
+                    return (
+                      <img
+                        key={clip.id}
+                        src={clip.thumbnailUrl}
+                        alt={clip.file.name}
+                        className={`absolute inset-0 h-full w-full ${fitClass} transition-opacity duration-75 ${
+                          isActive
+                            ? "z-[1] opacity-100"
+                            : "z-0 opacity-0 pointer-events-none"
+                        }`}
+                      />
+                    );
+                  }
+
                   return (
                     <video
                       key={clip.id}
@@ -498,7 +525,8 @@ export function HookPreviewStage({
                           poolVideoRefs.current.delete(clip.id);
                         }
                       }}
-                      src={clip.url}
+                      src={clipPlayableUrl}
+                      poster={clip.thumbnailUrl}
                       muted
                       playsInline
                       preload="auto"
@@ -515,11 +543,21 @@ export function HookPreviewStage({
                   ref={videoRef}
                   key={displayVideoUrl}
                   src={displayVideoUrl}
+                  poster={video?.thumbnailUrl}
                   autoPlay
                   loop
                   muted={muteAudio}
                   playsInline
                   preload="auto"
+                  onLoadedMetadata={(e) => {
+                    if (e.currentTarget.videoWidth === 0) {
+                      setDecodeErrorState({
+                        url: displayVideoUrl,
+                        message:
+                          "Browser cannot preview this video codec directly — FFmpeg can still render it.",
+                      });
+                    }
+                  }}
                   onLoadedData={(e) => {
                     const vid = e.currentTarget;
                     vid.play().catch(() => {
@@ -529,9 +567,11 @@ export function HookPreviewStage({
                     });
                   }}
                   onError={() => {
-                    setVideoDecodeError(
-                      "Browser cannot preview this video codec directly — FFmpeg can still render it."
-                    );
+                    setDecodeErrorState({
+                      url: displayVideoUrl,
+                      message:
+                        "Browser cannot preview this video codec directly — FFmpeg can still render it.",
+                    });
                   }}
                   className={`h-full w-full ${fitClass}`}
                 />
@@ -544,6 +584,26 @@ export function HookPreviewStage({
                   </div>
                 )}
               </>
+            ) : video?.thumbnailUrl ? (
+              <div className="relative h-full w-full">
+                <img
+                  src={video.thumbnailUrl}
+                  alt={video.file.name}
+                  className={`h-full w-full ${fitClass}`}
+                />
+                {video.isGeneratingProxy && (
+                  <span className="pointer-events-none absolute bottom-2.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full border border-white/15 bg-black/75 px-2.5 py-0.5 font-mono text-[9px] text-[#C4C7D0] backdrop-blur-sm">
+                    Preparing video preview...
+                  </span>
+                )}
+              </div>
+            ) : video?.isGeneratingProxy ? (
+              <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-6 text-center">
+                <Film className="h-5 w-5 animate-pulse text-[#FF4D2E]" />
+                <p className="font-mono text-[11px] text-[#C4C7D0]">
+                  Preparing clip preview...
+                </p>
+              </div>
             ) : (
               <div className="flex h-full w-full flex-col items-center justify-center gap-2 p-6 text-center">
                 <Film className="h-5 w-5 text-[#555966]" />

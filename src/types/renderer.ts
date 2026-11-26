@@ -16,7 +16,73 @@ export type VideoFilterPresetId =
   | "midnight-studio"
   | "warm-film"
   | "crisp-pop"
-  | "bw-noir";
+  | "bw-noir"
+  | "vhs-faded"
+  | "hyperpop-neon"
+  | "dreamy-pastel";
+
+export type EditStyleId =
+  | "pov-vibe"
+  | "kinetic-lyric"
+  | "fast-montage"
+  | "car-performance"
+  | "hyperpop-glitch"
+  | "vhs-lofi"
+  | "storytime-drop"
+  | "demo-vs-master"
+  | "split-visualizer"
+  | "seamless-loop"
+  | "ghost-slowmo"
+  | "raw-acoustic";
+
+export type EditStylePacing =
+  | "every-beat"
+  | "balanced"
+  | "every-2-beats"
+  | "bar-boundary"
+  | "two-act"
+  | "single-take";
+
+export type EditStyleMotion =
+  | "none"
+  | "slow-push"
+  | "beat-pulse"
+  | "punch-zoom"
+  | "whip-pan"
+  | "handheld"
+  | "slow-mo";
+
+export type EditStyleEffect =
+  | "none"
+  | "flash-drop"
+  | "rgb-glitch"
+  | "vhs-tape"
+  | "halation-bloom"
+  | "split-pane"
+  | "dim-backdrop";
+
+export type EditStyleCategory =
+  | "hook"
+  | "lyric"
+  | "energy"
+  | "aesthetic"
+  | "performance";
+
+export interface EditStylePreset {
+  id: EditStyleId;
+  label: string;
+  badge: string;
+  category: EditStyleCategory;
+  description: string;
+  swatch: string;
+  pacing: EditStylePacing;
+  motion: EditStyleMotion;
+  effect: EditStyleEffect;
+  filterPreset: VideoFilterPresetId;
+  suggestedHook: string;
+  singleClipStrategy: string;
+  multiClipStrategy: string;
+}
 
 export interface VideoFilterConfig {
   preset: VideoFilterPresetId;
@@ -50,6 +116,10 @@ export interface TextPreset {
 export interface VideoMetadata {
   file: File;
   url: string;
+  previewUrl?: string;
+  thumbnailUrl?: string;
+  browserPlayable?: boolean;
+  isGeneratingProxy?: boolean;
   width: number;
   height: number;
   duration: number;
@@ -106,4 +176,10 @@ export interface BeatCutSegment {
   clipId: string;
   clipName: string;
   sourceStart: number;
+  zoom?: number;
+  panX?: number;
+  panY?: number;
+  speed?: number;
+  effect?: EditStyleEffect;
+  transitionFlash?: boolean;
 }

@@ -1,5 +1,9 @@
 import type {
   AspectMode,
+  EditStyleEffect,
+  EditStyleId,
+  EditStyleMotion,
+  EditStylePreset,
   VideoCropRect,
   VideoFilterConfig,
   VideoFilterPresetId,
@@ -98,7 +102,253 @@ export const VIDEO_FILTER_PRESETS: VideoFilterPreset[] = [
       vignette: 0.45,
     },
   },
+  {
+    id: "vhs-faded",
+    label: "VHS Faded",
+    badge: "90s Tape",
+    swatch: "linear-gradient(135deg, #2a1f2d 0%, #6b4e57 55%, #d6b88d 100%)",
+    config: {
+      preset: "vhs-faded",
+      brightness: 0.01,
+      contrast: 0.94,
+      saturation: 0.84,
+      temperature: 0.28,
+      fade: 0.22,
+      vignette: 0.42,
+    },
+  },
+  {
+    id: "hyperpop-neon",
+    label: "Hyperpop Neon",
+    badge: "808",
+    swatch: "linear-gradient(135deg, #1b0b3b 0%, #9d174d 55%, #22d3ee 100%)",
+    config: {
+      preset: "hyperpop-neon",
+      brightness: 0.04,
+      contrast: 1.32,
+      saturation: 1.48,
+      temperature: -0.22,
+      fade: 0,
+      vignette: 0.28,
+    },
+  },
+  {
+    id: "dreamy-pastel",
+    label: "Dreamy Pastel",
+    badge: "Bloom",
+    swatch: "linear-gradient(135deg, #2c243b 0%, #7c6799 55%, #f3c6d8 100%)",
+    config: {
+      preset: "dreamy-pastel",
+      brightness: 0.05,
+      contrast: 0.92,
+      saturation: 0.88,
+      temperature: 0.16,
+      fade: 0.16,
+      vignette: 0.22,
+    },
+  },
 ];
+
+export const EDIT_STYLE_PRESETS: EditStylePreset[] = [
+  {
+    id: "pov-vibe",
+    label: "POV / Relatable Vibe",
+    badge: "2–4s Bars",
+    category: "hook",
+    description:
+      "Moody bar-synced cuts with subtle push-in and persistent top POV hook.",
+    swatch: "linear-gradient(135deg, #0b2230 0%, #163e4a 55%, #d4a72c 100%)",
+    pacing: "bar-boundary",
+    motion: "slow-push",
+    effect: "none",
+    filterPreset: "midnight-studio",
+    suggestedHook: "POV: driving home at 2am...",
+    singleClipStrategy: "Alternating digital punch-ins (1.0x → 1.15x) on bar changes",
+    multiClipStrategy: "Sequences 3–6 moody B-roll clips on bar boundaries",
+  },
+  {
+    id: "kinetic-lyric",
+    label: "Kinetic Lyric Edit",
+    badge: "1–2 Beats",
+    category: "lyric",
+    description:
+      "Dimmed backdrop for crisp center lyrics with kick-drum scale bounce.",
+    swatch: "linear-gradient(135deg, #12131a 0%, #2a2d3d 55%, #ff4d2e 100%)",
+    pacing: "every-2-beats",
+    motion: "beat-pulse",
+    effect: "dim-backdrop",
+    filterPreset: "midnight-studio",
+    suggestedHook: "When he says...",
+    singleClipStrategy: "Continuous shot with beat-synced zoom pulses & pan shifts",
+    multiClipStrategy: "Cuts B-roll every 2 beats behind kinetic lyric captions",
+  },
+  {
+    id: "fast-montage",
+    label: "Fast-Cut B-Roll Montage",
+    badge: "Every Beat",
+    category: "energy",
+    description:
+      "Rapid 0.25–0.75s transient-locked cuts with crisp pop grade & drop flashes.",
+    swatch: "linear-gradient(135deg, #1d263b 0%, #3a5a8c 55%, #ff6b4a 100%)",
+    pacing: "every-beat",
+    motion: "whip-pan",
+    effect: "flash-drop",
+    filterPreset: "crisp-pop",
+    suggestedHook: "Wait for the drop",
+    singleClipStrategy: "Extracts 8–15 micro-slices with 1.1x–1.35x crops & speed ramps",
+    multiClipStrategy: "Rapidly cycles all B-roll clips locked to snare/kick hits",
+  },
+  {
+    id: "car-performance",
+    label: "Car-Test / Studio Take",
+    badge: "Dynamic Zoom",
+    category: "performance",
+    description:
+      "Natural smartphone look with wide → medium → tight punch-ins on drops.",
+    swatch: "linear-gradient(135deg, #1f242d 0%, #3d4452 55%, #e4e4e7 100%)",
+    pacing: "bar-boundary",
+    motion: "punch-zoom",
+    effect: "none",
+    filterPreset: "crisp-pop",
+    suggestedHook: "Testing my unreleased track in the car",
+    singleClipStrategy: "Keyframed wide (1.0x) → medium (1.2x) → tight (1.35x) crops",
+    multiClipStrategy: "Cuts between performance angles on vocal phrase boundaries",
+  },
+  {
+    id: "hyperpop-glitch",
+    label: "Hyperpop / Trap Glitch",
+    badge: "808 Flash",
+    category: "energy",
+    description:
+      "Ultra-tight 808 cuts with RGB split, high contrast, and strobe flashes.",
+    swatch: "linear-gradient(135deg, #1b0b3b 0%, #9d174d 55%, #22d3ee 100%)",
+    pacing: "every-beat",
+    motion: "punch-zoom",
+    effect: "rgb-glitch",
+    filterPreset: "hyperpop-neon",
+    suggestedHook: "WAIT FOR IT",
+    singleClipStrategy: "Rapid jump-cuts, 1.3x punch-ins, and RGB-split pulses on 808s",
+    multiClipStrategy: "Rapid-fire clip switching with glitch transitions & flash frames",
+  },
+  {
+    id: "vhs-lofi",
+    label: "VHS / Camcorder Lo-Fi",
+    badge: "90s Tape",
+    category: "aesthetic",
+    description:
+      "Warm faded vintage grade with tape noise, lifted blacks, and gentle sway.",
+    swatch: "linear-gradient(135deg, #2a1f2d 0%, #6b4e57 55%, #d6b88d 100%)",
+    pacing: "balanced",
+    motion: "handheld",
+    effect: "vhs-tape",
+    filterPreset: "vhs-faded",
+    suggestedHook: "3AM voice memo",
+    singleClipStrategy: "Continuous VHS treatment with occasional tape-skip jump cuts",
+    multiClipStrategy: "Stitches clips with organic 1.5–3.5s analog tape cuts",
+  },
+  {
+    id: "storytime-drop",
+    label: "Storytime → Beat Drop",
+    badge: "Two-Act",
+    category: "hook",
+    description:
+      "Raw ungraded intro hook that snaps to punchy grade + cuts on the drop.",
+    swatch: "linear-gradient(135deg, #2b1d14 0%, #7d4c2a 60%, #ff4d2e 100%)",
+    pacing: "two-act",
+    motion: "punch-zoom",
+    effect: "flash-drop",
+    filterPreset: "warm-film",
+    suggestedHook: "I wrote this after...",
+    singleClipStrategy: "Holds 1.0x framing in intro, snap-zooms to 1.2x on beat drop",
+    multiClipStrategy: "Act 1 talking/intro clip → hard cut to B-roll montage on drop",
+  },
+  {
+    id: "demo-vs-master",
+    label: "Demo vs. Final Master",
+    badge: "Before/After",
+    category: "hook",
+    description:
+      "Stripped cool/desaturated demo act snapping into saturated master cuts.",
+    swatch: "linear-gradient(135deg, #1f2937 0%, #4b5563 45%, #f59e0b 100%)",
+    pacing: "two-act",
+    motion: "beat-pulse",
+    effect: "flash-drop",
+    filterPreset: "crisp-pop",
+    suggestedHook: "Voice memo at 2am → Final master",
+    singleClipStrategy: "Act 1 wide desaturated shot → Act 2 punchy tight crop",
+    multiClipStrategy: "Act 1 raw casual clip → Act 2 polished studio/B-roll cuts",
+  },
+  {
+    id: "split-visualizer",
+    label: "Split-Screen / Visualizer",
+    badge: "Dual Pane",
+    category: "performance",
+    description:
+      "Dual-pane framing with steady secondary cuts and beat-reactive energy.",
+    swatch: "linear-gradient(135deg, #0f172a 0%, #334155 50%, #38bdf8 100%)",
+    pacing: "balanced",
+    motion: "beat-pulse",
+    effect: "split-pane",
+    filterPreset: "midnight-studio",
+    suggestedHook: "First time hearing the final mix",
+    singleClipStrategy: "Top tight subject crop + bottom wide/mirrored detail crop",
+    multiClipStrategy: "Top performance/reaction pane + bottom rotating B-roll",
+  },
+  {
+    id: "seamless-loop",
+    label: "Seamless Infinite Loop",
+    badge: "10–15s Loop",
+    category: "aesthetic",
+    description:
+      "Cohesive continuous motion engineered to bridge tail cleanly back to head.",
+    swatch: "linear-gradient(135deg, #1e1b4b 0%, #4338ca 55%, #a5b4fc 100%)",
+    pacing: "balanced",
+    motion: "slow-push",
+    effect: "none",
+    filterPreset: "warm-film",
+    suggestedHook: "Wait until it loops...",
+    singleClipStrategy: "Continuous 10–15s segment with smooth push-in & tail-to-head bridge",
+    multiClipStrategy: "Matches exit motion of last clip to entry motion of first clip",
+  },
+  {
+    id: "ghost-slowmo",
+    label: "Ghost Lyric / Slow-Mo",
+    badge: "Dreamy 0.6x",
+    category: "lyric",
+    description:
+      "Dreamy slow-motion playback with soft halation bloom and pastel/noir grade.",
+    swatch: "linear-gradient(135deg, #2c243b 0%, #7c6799 55%, #f3c6d8 100%)",
+    pacing: "bar-boundary",
+    motion: "slow-mo",
+    effect: "halation-bloom",
+    filterPreset: "dreamy-pastel",
+    suggestedHook: "you still cross my mind...",
+    singleClipStrategy: "Smooth 0.6x–0.75x slow-mo with gentle continuous drift",
+    multiClipStrategy: "Long 3.5–6s slow-mo B-roll cuts with dreamy bloom",
+  },
+  {
+    id: "raw-acoustic",
+    label: "Raw Acoustic / Live",
+    badge: "Single Take",
+    category: "performance",
+    description:
+      "Zero heavy VFX; natural lighting with imperceptible 1.0→1.05x creep-in.",
+    swatch: "linear-gradient(135deg, #26221e 0%, #574c41 55%, #d6cbbd 100%)",
+    pacing: "single-take",
+    motion: "slow-push",
+    effect: "none",
+    filterPreset: "none",
+    suggestedHook: "No autotune, just a mic",
+    singleClipStrategy: "Single continuous take with gentle 1.0→1.05x slow push-in",
+    multiClipStrategy: "Uses 1–2 longest performance takes with minimal cuts",
+  },
+];
+
+export function getEditStylePreset(id?: EditStyleId | null): EditStylePreset {
+  return (
+    EDIT_STYLE_PRESETS.find((style) => style.id === id) ?? EDIT_STYLE_PRESETS[0]
+  );
+}
 
 export function isCropActive(crop?: VideoCropRect | null): boolean {
   if (!crop) return false;
@@ -190,6 +440,36 @@ export function buildFFmpegColorFilters(filter?: VideoFilterConfig): string[] {
   return parts;
 }
 
+export function buildFFmpegStyleEffectFilters(
+  effect?: EditStyleEffect | null,
+  motion?: EditStyleMotion | null
+): string[] {
+  const parts: string[] = [];
+
+  if (effect === "vhs-tape") {
+    // Subtle analog tape grain + soft focus
+    parts.push("noise=alls=14:allf=t+u", "unsharp=5:5:-0.35:5:5:0.0");
+  } else if (effect === "rgb-glitch") {
+    // Crisp edge punch + subtle chroma shift for hyperpop/trap energy
+    parts.push("chromashift=cbh=3:crh=-3", "unsharp=5:5:0.8:5:5:0.0");
+  } else if (effect === "halation-bloom") {
+    // Soft dreamy glow
+    parts.push("gblur=sigma=0.6");
+  } else if (effect === "dim-backdrop") {
+    // Slight dim + vignette for high-contrast kinetic lyrics
+    parts.push("eq=brightness=-0.08:contrast=1.08", "vignette=angle=0.75");
+  } else if (effect === "flash-drop") {
+    // Punchy micro-contrast for beat-drop montages
+    parts.push("unsharp=5:5:0.5:5:5:0.0");
+  }
+
+  if (motion === "slow-mo") {
+    parts.push("setpts=1.45*PTS");
+  }
+
+  return parts;
+}
+
 export function buildFFmpegCropFilter(crop?: VideoCropRect | null): string | null {
   if (!crop || !isCropActive(crop)) return null;
   const x = Math.max(0, Math.min(0.85, crop.x));
@@ -205,6 +485,8 @@ export function buildFFmpegVideoChain({
   targetHeight,
   crop,
   filter,
+  effect,
+  motion,
   fps,
 }: {
   aspectMode: AspectMode;
@@ -212,6 +494,8 @@ export function buildFFmpegVideoChain({
   targetHeight?: number;
   crop?: VideoCropRect | null;
   filter?: VideoFilterConfig | null;
+  effect?: EditStyleEffect | null;
+  motion?: EditStyleMotion | null;
   fps?: number;
 }): string {
   const filters: string[] = [];
@@ -243,6 +527,7 @@ export function buildFFmpegVideoChain({
   }
 
   filters.push(...buildFFmpegColorFilters(filter ?? undefined));
+  filters.push(...buildFFmpegStyleEffectFilters(effect, motion));
 
   if (fps) {
     filters.push(`fps=${fps}`);
