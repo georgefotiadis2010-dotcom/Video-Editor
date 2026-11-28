@@ -70,6 +70,7 @@ export function HookPreviewStage({
   const poolVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const activeSegIdxRef = useRef<number>(-1);
+  const flashTimeoutRef = useRef<number | null>(null);
   const cropDragRef = useRef<{
     handle: "move" | "nw" | "ne" | "sw" | "se";
     startX: number;
@@ -83,7 +84,9 @@ export function HookPreviewStage({
   const [activePreviewClipId, setActivePreviewClipId] = useState<string | null>(
     null
   );
+  const [activeSegIndex, setActiveSegIndex] = useState<number | null>(null);
   const [activeSegLabel, setActiveSegLabel] = useState<string | null>(null);
+  const [flashActive, setFlashActive] = useState(false);
   const [decodeErrorState, setDecodeErrorState] = useState<{
     url: string;
     message: string;
@@ -123,7 +126,13 @@ export function HookPreviewStage({
   const stopBeatPreview = useCallback(() => {
     setIsBeatPlaying(false);
     setActivePreviewClipId(null);
+    setActiveSegIndex(null);
     setActiveSegLabel(null);
+    setFlashActive(false);
+    if (flashTimeoutRef.current !== null) {
+      window.clearTimeout(flashTimeoutRef.current);
+      flashTimeoutRef.current = null;
+    }
     activeSegIdxRef.current = -1;
     if (audioRef.current) {
       audioRef.current.pause();
@@ -132,6 +141,20 @@ export function HookPreviewStage({
       vid.pause();
     }
   }, []);
+
+  // Pause beat preview if another audio player (e.g. WaveformBeatEditor) starts playing
+  useEffect(() => {
+    const handleOtherAudioPlay = (e: Event) => {
+      const detail = (e as CustomEvent<{ source?: string }>).detail;
+      if (detail?.source !== "preview") {
+        stopBeatPreview();
+      }
+    };
+    window.addEventListener("lxg-audio-play", handleOtherAudioPlay);
+    return () => {
+      window.removeEventListener("lxg-audio-play", handleOtherAudioPlay);
+    };
+  }, [stopBeatPreview]);
 
   // Manage audio element for live beat-sync preview
   useEffect(() => {
@@ -161,6 +184,9 @@ export function HookPreviewStage({
     const { windowStart, windowEnd, segments } = beatSyncPreview;
     activeSegIdxRef.current = -1;
     audio.currentTime = windowStart;
+    window.dispatchEvent(
+      new CustomEvent("lxg-audio-play", { detail: { source: "preview" } })
+    );
     audio.play().catch(() => {});
 
     const seekAndPlayPoolVideo = (
@@ -222,7 +248,21 @@ export function HookPreviewStage({
         }
 
         setActivePreviewClipId(seg.clipId);
+        setActiveSegIndex(segIdx);
         setActiveSegLabel(`Cut ${segIdx + 1}/${segments.length}`);
+
+        if (seg.transitionFlash) {
+          if (flashTimeoutRef.current !== null) {
+            window.clearTimeout(flashTimeoutRef.current);
+          }
+          setFlashActive(true);
+          flashTimeoutRef.current = window.setTimeout(() => {
+            setFlashActive(false);
+            flashTimeoutRef.current = null;
+          }, 150);
+        } else {
+          setFlashActive(false);
+        }
 
         const offsetInSeg = Math.max(0, t - seg.startTime);
         seekAndPlayPoolVideo(seg.clipId, seg.sourceStart + offsetInSeg, true);
@@ -308,6 +348,32 @@ export function HookPreviewStage({
   const fitClass = aspectMode === "force-9x16" ? "object-cover" : "object-contain";
 
   const cssFilter = buildPreviewCssFilter(videoFilter);
+
+  const activeSegment = useMemo(() => {
+    if (!effectiveBeatPlaying || !beatSyncPreview) return null;
+    if (
+      activeSegIndex !== null &&
+      activeSegIndex >= 0 &&
+      activeSegIndex < beatSyncPreview.segments.length
+    ) {
+      return beatSyncPreview.segments[activeSegIndex];
+    }
+    return beatSyncPreview.segments[0] ?? null;
+  }, [effectiveBeatPlaying, beatSyncPreview, activeSegIndex]);
+
+  const activeSegmentMotionStyle = useMemo<React.CSSProperties | undefined>(() => {
+    if (!activeSegment) return undefined;
+    const zoom = Math.max(1, activeSegment.zoom ?? 1);
+    const panX = Math.max(-1, Math.min(1, activeSegment.panX ?? 0));
+    const panY = Math.max(-1, Math.min(1, activeSegment.panY ?? 0));
+    const maxShiftPct = zoom > 1 ? ((zoom - 1) / (2 * zoom)) * 100 : 0;
+    const txPct = (-panX * maxShiftPct).toFixed(3);
+    const tyPct = (-panY * maxShiftPct).toFixed(3);
+    return {
+      transform: `scale(${zoom.toFixed(4)}) translate(${txPct}%, ${tyPct}%)`,
+      transition: "transform 180ms ease-out",
+    };
+  }, [activeSegment]);
 
   // Compute uniform crop preview transform when not actively editing the crop box
   const cropTransformStyle = useMemo<React.CSSProperties | undefined>(() => {
@@ -409,8 +475,10 @@ export function HookPreviewStage({
               onClick={() =>
                 effectiveBeatPlaying ? stopBeatPreview() : setIsBeatPlaying(true)
               }
-              className={`nb-key inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider ${
-                effectiveBeatPlaying ? "nb-key-primary" : ""
+              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 font-mono text-[10px] font-bold uppercase tracking-wider transition-all ${
+                effectiveBeatPlaying
+                  ? "nb-key nb-key-primary"
+                  : "nb-key-primary shadow-[0_0_16px_rgba(255,77,46,0.35)] hover:brightness-110"
               }`}
               title="Preview beat-synced cuts with music & text overlay in real time"
             >
@@ -421,7 +489,7 @@ export function HookPreviewStage({
                 </>
               ) : (
                 <>
-                  <Play className="h-3 w-3 fill-current text-[#FF4D2E]" />
+                  <Play className="h-3 w-3 fill-current" />
                   <span>Beat Preview</span>
                 </>
               )}
@@ -506,6 +574,7 @@ export function HookPreviewStage({
                         key={clip.id}
                         src={clip.thumbnailUrl}
                         alt={clip.file.name}
+                        style={isActive ? activeSegmentMotionStyle : undefined}
                         className={`absolute inset-0 h-full w-full ${fitClass} transition-opacity duration-75 ${
                           isActive
                             ? "z-[1] opacity-100"
@@ -530,6 +599,7 @@ export function HookPreviewStage({
                       muted
                       playsInline
                       preload="auto"
+                      style={isActive ? activeSegmentMotionStyle : undefined}
                       className={`absolute inset-0 h-full w-full ${fitClass} transition-opacity duration-75 ${
                         isActive ? "z-[1] opacity-100" : "z-0 opacity-0 pointer-events-none"
                       }`}
@@ -645,10 +715,31 @@ export function HookPreviewStage({
             />
           )}
 
+          {/* Transition Flash Overlay during Beat Preview */}
+          {effectiveBeatPlaying && (
+            <div
+              className={`pointer-events-none absolute inset-0 z-[1] bg-white transition-opacity duration-150 ${
+                flashActive ? "opacity-55" : "opacity-0"
+              }`}
+            />
+          )}
+
           {effectiveBeatPlaying && activeSegLabel && (
             <span className="pointer-events-none absolute left-2.5 top-2.5 z-10 rounded-full border border-white/15 bg-black/75 px-2 py-0.5 font-mono text-[10px] font-bold text-[#FF4D2E] backdrop-blur-sm">
               {activeSegLabel}
             </span>
+          )}
+
+          {canBeatPreview && !effectiveBeatPlaying && !isCropping && (
+            <button
+              type="button"
+              onClick={() => setIsBeatPlaying(true)}
+              className="nb-key-primary absolute bottom-4 left-1/2 z-[4] inline-flex -translate-x-1/2 items-center gap-2 whitespace-nowrap rounded-full px-4 py-2 font-mono text-[11px] font-bold uppercase tracking-wider shadow-[0_6px_24px_rgba(255,77,46,0.45)] transition-transform hover:scale-105"
+              title="Play live beat-synced preview with music"
+            >
+              <Play className="h-3.5 w-3.5 fill-current" />
+              <span>Play Beat Preview</span>
+            </button>
           )}
 
           {/* WYSIWYG Canvas Overlay */}

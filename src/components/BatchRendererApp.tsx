@@ -3,8 +3,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
 import {
+  AlertCircle,
   Archive,
   CheckCircle2,
+  ChevronDown,
   Download,
   FileVideo,
   Layers,
@@ -12,6 +14,7 @@ import {
   Loader2,
   Music,
   Play,
+  RotateCcw,
   Sliders,
   Sparkles,
   Square,
@@ -56,7 +59,6 @@ import {
 } from "@/lib/text-overlay";
 import type {
   AspectMode,
-  EditStyleId,
   EditorMode,
   FontFamilyOption,
   PillStyleOption,
@@ -67,6 +69,16 @@ import type {
   VideoFilterConfig,
   VideoMetadata,
 } from "@/types/renderer";
+
+type BatchQueueStatus = "queued" | "rendering" | "done" | "error";
+
+interface BatchQueueItem {
+  index: number;
+  hookText: string;
+  filename: string;
+  status: BatchQueueStatus;
+  error?: string;
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -112,9 +124,9 @@ export function BatchRendererApp() {
 
   const [styleConfig, setStyleConfig] =
     useState<TextStyleConfig>(DEFAULT_TEXT_STYLE);
+  const [showStyleCustomize, setShowStyleCustomize] = useState(false);
   const [videoFilter, setVideoFilter] =
     useState<VideoFilterConfig>(DEFAULT_VIDEO_FILTER);
-  const [editStyle, setEditStyle] = useState<EditStyleId | undefined>(undefined);
   const [videoCrop, setVideoCrop] =
     useState<VideoCropRect>(DEFAULT_VIDEO_CROP);
   const [aspectMode, setAspectMode] = useState<AspectMode>("force-9x16");
@@ -132,6 +144,7 @@ export function BatchRendererApp() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   const [renderedClips, setRenderedClips] = useState<RenderedClip[]>([]);
+  const [queueItems, setQueueItems] = useState<BatchQueueItem[]>([]);
   const [previewClip, setPreviewClip] = useState<RenderedClip | null>(null);
   const [isZipping, setIsZipping] = useState(false);
 
@@ -167,6 +180,17 @@ export function BatchRendererApp() {
     return () => window.clearInterval(timer);
   }, [phase]);
 
+  // Warn before closing tab while a batch or retry render is active
+  useEffect(() => {
+    if (phase !== "loading-ffmpeg" && phase !== "rendering") return;
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [phase]);
+
   useEffect(() => {
     if (!previewClip) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -183,6 +207,7 @@ export function BatchRendererApp() {
       }
       return [];
     });
+    setQueueItems([]);
     setPreviewClip(null);
   }, []);
 
@@ -293,6 +318,14 @@ export function BatchRendererApp() {
 
     cancelRequestedRef.current = false;
     clearRenderedClips();
+    setQueueItems(
+      hooks.map((hookText, index) => ({
+        index,
+        hookText,
+        filename: slugifyHook(hookText, index),
+        status: "queued",
+      }))
+    );
     setErrorMessage(null);
     setElapsedSeconds(0);
     setCurrentClipIndex(0);
@@ -337,6 +370,7 @@ export function BatchRendererApp() {
         }
 
         let sourceWritten = false;
+        let failedCount = 0;
 
         for (let i = 0; i < hooks.length; i++) {
           if (cancelRequestedRef.current) {
@@ -351,72 +385,117 @@ export function BatchRendererApp() {
           const filename = slugifyHook(hookText, i);
           setCurrentClipIndex(i);
           setCurrentClipProgress(0);
+          setQueueItems((prev) =>
+            prev.map((item) =>
+              item.index === i
+                ? { ...item, status: "rendering", error: undefined }
+                : item
+            )
+          );
           setStatusMessage(
             `Rendering clip ${i + 1} of ${hooks.length}: "${hookText.slice(0, 48)}${hookText.length > 48 ? "…" : ""}"`
           );
 
-          const clipStart = performance.now();
-          const overlayPngBytes = await renderHookOverlayPng(
-            targetWidth,
-            targetHeight,
-            hookText,
-            styleConfig
-          );
+          try {
+            const clipStart = performance.now();
+            const overlayPngBytes = await renderHookOverlayPng(
+              targetWidth,
+              targetHeight,
+              hookText,
+              styleConfig
+            );
 
-          const blob = useSharedBase
-            ? await renderHookOnSingleLoopBase(
-                ffmpeg,
-                overlayPngBytes,
-                filename,
-                muteAudio,
-                (ratio) => setCurrentClipProgress(ratio)
+            const blob = useSharedBase
+              ? await renderHookOnSingleLoopBase(
+                  ffmpeg,
+                  overlayPngBytes,
+                  filename,
+                  muteAudio,
+                  (ratio) => setCurrentClipProgress(ratio)
+                )
+              : await renderSingleHookVideo({
+                  ffmpeg,
+                  sourceFile: video.file,
+                  sourceWritten,
+                  overlayPngBytes,
+                  outputFilename: filename,
+                  aspectMode,
+                  muteAudio,
+                  videoFilter,
+                  videoCrop,
+                  onProgress: (ratio) => setCurrentClipProgress(ratio),
+                });
+
+            sourceWritten = true;
+
+            if (cancelRequestedRef.current) {
+              setPhase("cancelled");
+              setStatusMessage("Batch render cancelled.");
+              break;
+            }
+
+            const url = URL.createObjectURL(blob);
+            const clip: RenderedClip = {
+              id: `${i}-${Date.now()}`,
+              index: i,
+              hookText,
+              filename,
+              blob,
+              url,
+              sizeBytes: blob.size,
+              renderMs: Math.round(performance.now() - clipStart),
+            };
+
+            setRenderedClips((prev) => [...prev, clip]);
+            setQueueItems((prev) =>
+              prev.map((item) =>
+                item.index === i
+                  ? { ...item, status: "done", error: undefined }
+                  : item
               )
-            : await renderSingleHookVideo({
-                ffmpeg,
-                sourceFile: video.file,
-                sourceWritten,
-                overlayPngBytes,
-                outputFilename: filename,
-                aspectMode,
-                muteAudio,
-                videoFilter,
-                videoCrop,
-                onProgress: (ratio) => setCurrentClipProgress(ratio),
-              });
+            );
 
-          sourceWritten = true;
-
-          if (cancelRequestedRef.current) {
-            setPhase("cancelled");
-            setStatusMessage("Batch render cancelled.");
-            break;
-          }
-
-          const url = URL.createObjectURL(blob);
-          const clip: RenderedClip = {
-            id: `${i}-${Date.now()}`,
-            index: i,
-            hookText,
-            filename,
-            blob,
-            url,
-            sizeBytes: blob.size,
-            renderMs: Math.round(performance.now() - clipStart),
-          };
-
-          setRenderedClips((prev) => [...prev, clip]);
-
-          if (autoDownloadEach) {
-            triggerDownload(url, filename);
+            if (autoDownloadEach) {
+              triggerDownload(url, filename);
+            }
+          } catch (itemErr) {
+            if (cancelRequestedRef.current) {
+              setPhase("cancelled");
+              setStatusMessage("Batch render cancelled.");
+              break;
+            }
+            failedCount += 1;
+            const itemMsg = formatFFmpegError(itemErr);
+            setQueueItems((prev) =>
+              prev.map((item) =>
+                item.index === i
+                  ? { ...item, status: "error", error: itemMsg }
+                  : item
+              )
+            );
+            if (!isFFmpegLoaded()) {
+              resetFFmpeg();
+              break;
+            }
           }
         }
 
         if (!cancelRequestedRef.current) {
-          setPhase("completed");
-          setCurrentClipProgress(1);
-          setStatusMessage(
-            `Done! Rendered ${hooks.length} unique MP4${hooks.length === 1 ? "" : "s"} locally.`
-          );
+          if (failedCount > 0) {
+            setPhase("error");
+            setErrorMessage(
+              `${failedCount} clip${failedCount === 1 ? "" : "s"} failed. Use Retry on failed items below.`
+            );
+            setStatusMessage(
+              `Finished with ${failedCount} failed clip${failedCount === 1 ? "" : "s"}.`
+            );
+          } else {
+            setPhase("completed");
+            setCurrentClipProgress(1);
+            setStatusMessage(
+              `Done! Rendered ${hooks.length} unique MP4${hooks.length === 1 ? "" : "s"} locally.`
+            );
+          }
         }
       } finally {
         await cleanupSourceFile(ffmpeg);
@@ -435,6 +514,147 @@ export function BatchRendererApp() {
       setPhase("error");
       setErrorMessage(message);
       setStatusMessage("Render failed. Check the error message below.");
+    }
+  };
+
+  const handleRetryItem = async (itemIndex: number) => {
+    if (!video || phase === "loading-ffmpeg" || phase === "rendering") return;
+    const targetItem = queueItems.find((item) => item.index === itemIndex);
+    if (!targetItem) return;
+
+    cancelRequestedRef.current = false;
+    setErrorMessage(null);
+    setElapsedSeconds(0);
+    setCurrentClipIndex(itemIndex);
+    setCurrentClipProgress(0);
+    setPhase("loading-ffmpeg");
+    setStatusMessage(`Retrying clip #${itemIndex + 1}...`);
+    setQueueItems((prev) =>
+      prev.map((item) =>
+        item.index === itemIndex
+          ? { ...item, status: "rendering", error: undefined }
+          : item
+      )
+    );
+
+    const targetWidth =
+      aspectMode === "force-9x16"
+        ? 1080
+        : Math.max(2, Math.floor(video.width / 2) * 2);
+    const targetHeight =
+      aspectMode === "force-9x16"
+        ? 1920
+        : Math.max(2, Math.floor(video.height / 2) * 2);
+
+    try {
+      await waitForIdlePreviewQueue();
+      const ffmpeg = await getFFmpeg();
+      if (cancelRequestedRef.current) {
+        setPhase("cancelled");
+        setStatusMessage("Retry cancelled.");
+        return;
+      }
+
+      setPhase("rendering");
+      setStatusMessage(
+        `Retrying clip #${itemIndex + 1}: "${targetItem.hookText.slice(0, 48)}${targetItem.hookText.length > 48 ? "…" : ""}"`
+      );
+
+      try {
+        const clipStart = performance.now();
+        const overlayPngBytes = await renderHookOverlayPng(
+          targetWidth,
+          targetHeight,
+          targetItem.hookText,
+          styleConfig
+        );
+
+        const blob = await renderSingleHookVideo({
+          ffmpeg,
+          sourceFile: video.file,
+          sourceWritten: false,
+          overlayPngBytes,
+          outputFilename: targetItem.filename,
+          aspectMode,
+          muteAudio,
+          videoFilter,
+          videoCrop,
+          onProgress: (ratio) => setCurrentClipProgress(ratio),
+        });
+
+        if (cancelRequestedRef.current) {
+          setPhase("cancelled");
+          setStatusMessage("Retry cancelled.");
+          return;
+        }
+
+        const url = URL.createObjectURL(blob);
+        const clip: RenderedClip = {
+          id: `${itemIndex}-${Date.now()}`,
+          index: itemIndex,
+          hookText: targetItem.hookText,
+          filename: targetItem.filename,
+          blob,
+          url,
+          sizeBytes: blob.size,
+          renderMs: Math.round(performance.now() - clipStart),
+        };
+
+        setRenderedClips((prev) => {
+          const existing = prev.find((c) => c.index === itemIndex);
+          if (existing) {
+            URL.revokeObjectURL(existing.url);
+          }
+          return [...prev.filter((c) => c.index !== itemIndex), clip].sort(
+            (a, b) => a.index - b.index
+          );
+        });
+
+        const hasOtherErrors = queueItems.some(
+          (item) => item.index !== itemIndex && item.status === "error"
+        );
+        setQueueItems((prev) =>
+          prev.map((item) =>
+            item.index === itemIndex
+              ? { ...item, status: "done", error: undefined }
+              : item
+          )
+        );
+
+        if (autoDownloadEach) {
+          triggerDownload(url, targetItem.filename);
+        }
+
+        setPhase(hasOtherErrors ? "error" : "completed");
+        setCurrentClipProgress(1);
+        setStatusMessage(
+          hasOtherErrors
+            ? `Retried clip #${itemIndex + 1} successfully. Other failed items remain.`
+            : `Clip #${itemIndex + 1} rendered successfully.`
+        );
+      } finally {
+        await cleanupSourceFile(ffmpeg);
+      }
+    } catch (err) {
+      if (cancelRequestedRef.current) {
+        setPhase("cancelled");
+        setStatusMessage("Retry cancelled.");
+        return;
+      }
+      if (!isFFmpegLoaded()) {
+        resetFFmpeg();
+      }
+      const message = formatFFmpegError(err);
+      setQueueItems((prev) =>
+        prev.map((item) =>
+          item.index === itemIndex
+            ? { ...item, status: "error", error: message }
+            : item
+        )
+      );
+      setPhase("error");
+      setErrorMessage(message);
+      setStatusMessage(`Retry failed for clip #${itemIndex + 1}.`);
     }
   };
 
@@ -841,7 +1061,7 @@ export function BatchRendererApp() {
               </div>
 
               {/* Presets */}
-              <div className="mb-4 grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
                 {TEXT_PRESETS.map((preset) => (
                   <button
                     key={preset.id}
@@ -862,8 +1082,28 @@ export function BatchRendererApp() {
                 ))}
               </div>
 
-              {/* Controls Grid */}
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              {/* Tier 2 Progressive Disclosure Toggle */}
+              <button
+                type="button"
+                aria-expanded={showStyleCustomize}
+                onClick={() => setShowStyleCustomize((prev) => !prev)}
+                className="nb-key mt-4 flex w-full items-center justify-between rounded-2xl px-3.5 py-2.5 text-xs font-semibold text-[#C4C7D0]"
+              >
+                <span className="flex items-center gap-2">
+                  <Sliders className="h-3.5 w-3.5 text-[#FF4D2E]" />
+                  <span>Customize Style &amp; Color</span>
+                </span>
+                <ChevronDown
+                  className={`h-4 w-4 text-[#8B8F9C] transition-transform duration-200 ${
+                    showStyleCustomize ? "rotate-180" : ""
+                  }`}
+                />
+              </button>
+
+              {showStyleCustomize && (
+                <div className="mt-4 border-t border-white/10 pt-4">
+                  {/* Controls Grid */}
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 {/* Font Family */}
                 <div>
                   <label className="mb-1.5 block font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]">
@@ -1121,20 +1361,20 @@ export function BatchRendererApp() {
                 </label>
               </div>
 
-              <VideoEffectsPanel
-                videoFilter={videoFilter}
-                onChangeFilter={setVideoFilter}
-                videoCrop={videoCrop}
-                onChangeCrop={setVideoCrop}
-                editStyle={editStyle}
-                onChangeEditStyle={setEditStyle}
-                disabled={isBusy}
-              />
+                  <VideoEffectsPanel
+                    videoFilter={videoFilter}
+                    onChangeFilter={setVideoFilter}
+                    videoCrop={videoCrop}
+                    onChangeCrop={setVideoCrop}
+                    disabled={isBusy}
+                  />
+                </div>
+              )}
             </section>
           </div>
 
           {/* RIGHT COLUMN: PREVIEW & RENDER QUEUE (5 cols) */}
-          <div className="flex flex-col gap-6 lg:col-span-5">
+          <div className="flex flex-col gap-6 lg:sticky lg:top-6 lg:self-start lg:col-span-5">
             <HookPreviewStage
               video={video}
               hooks={hooks}
@@ -1161,7 +1401,7 @@ export function BatchRendererApp() {
                 )}
               </div>
 
-              <label className="mb-4 flex cursor-pointer items-center gap-2 text-xs font-medium text-[#C4C7D0]">
+              <label className="mb-3 flex cursor-pointer items-center gap-2 text-xs font-medium text-[#C4C7D0]">
                 <input
                   type="checkbox"
                   checked={autoDownloadEach}
@@ -1171,6 +1411,15 @@ export function BatchRendererApp() {
                 />
                 <span>Auto-download each MP4 immediately as it finishes</span>
               </label>
+
+              {/* Batch Summary */}
+              <div className="mb-3.5 flex items-center justify-between rounded-xl border border-white/10 bg-black/25 px-3 py-2 text-xs">
+                <span className="font-semibold text-[#9A9DA8]">Batch Summary</span>
+                <span className="font-mono font-bold text-[#F5F5F2]">
+                  {hooks.length} {hooks.length === 1 ? "video" : "videos"} •{" "}
+                  {aspectMode === "force-9x16" ? "9:16" : "Original"}
+                </span>
+              </div>
 
               {!isBusy ? (
                 <button
@@ -1266,6 +1515,79 @@ export function BatchRendererApp() {
                   className="mt-4 rounded-xl border border-red-500/40 bg-red-500/10 p-3 text-xs text-red-200"
                 >
                   {errorMessage}
+                </div>
+              )}
+
+              {/* Per-item Queue Status */}
+              {queueItems.length > 0 && (
+                <div className="mt-4 border-t border-white/10 pt-3.5">
+                  <div className="mb-2 flex items-center justify-between text-[11px] font-semibold text-[#9A9DA8]">
+                    <span>Queue</span>
+                    <span className="font-mono text-[#787C8A]">
+                      {queueItems.filter((item) => item.status === "done").length}
+                      /{queueItems.length} done
+                    </span>
+                  </div>
+                  <ul className="nb-scroll max-h-48 space-y-1.5 overflow-y-auto pr-1">
+                    {queueItems.map((item) => (
+                      <li
+                        key={item.index}
+                        className="flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-black/25 px-2.5 py-1.5 text-xs"
+                      >
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="font-mono text-[10px] font-bold text-[#8B8F9C]">
+                            #{String(item.index + 1).padStart(2, "0")}
+                          </span>
+                          <span
+                            className="truncate text-[11px] text-[#E6E8EE]"
+                            title={item.hookText}
+                          >
+                            {item.hookText}
+                          </span>
+                        </div>
+
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          {item.status === "queued" && (
+                            <span className="rounded-md bg-white/5 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#8B8F9C]">
+                              queued
+                            </span>
+                          )}
+                          {item.status === "rendering" && (
+                            <span className="inline-flex items-center gap-1 rounded-md bg-[#FF4D2E]/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-[#FF4D2E]">
+                              <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                              rendering
+                            </span>
+                          )}
+                          {item.status === "done" && (
+                            <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-emerald-300">
+                              <CheckCircle2 className="h-2.5 w-2.5" />
+                              done
+                            </span>
+                          )}
+                          {item.status === "error" && (
+                            <>
+                              <span
+                                title={item.error || "Render failed"}
+                                className="inline-flex items-center gap-1 rounded-md bg-red-500/15 px-1.5 py-0.5 font-mono text-[10px] font-bold text-red-300"
+                              >
+                                <AlertCircle className="h-2.5 w-2.5" />
+                                error
+                              </span>
+                              <button
+                                type="button"
+                                disabled={isBusy || !video}
+                                onClick={() => handleRetryItem(item.index)}
+                                className="nb-key inline-flex items-center gap-1 rounded-lg px-2 py-0.5 text-[10px] font-bold text-[#F5F5F2]"
+                              >
+                                <RotateCcw className="h-2.5 w-2.5" />
+                                Retry
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
             </section>

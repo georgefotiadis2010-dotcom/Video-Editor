@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
 import {
+  AlertCircle,
   Archive,
   CheckCircle2,
   ChevronDown,
@@ -14,8 +15,10 @@ import {
   Loader2,
   Music,
   Play,
+  RotateCcw,
   Shuffle,
   Sliders,
+  Sparkles,
   Square,
   Trash2,
   Upload,
@@ -28,7 +31,9 @@ import { WaveformBeatEditor } from "@/components/WaveformBeatEditor";
 import {
   DEFAULT_VIDEO_CROP,
   DEFAULT_VIDEO_FILTER,
+  EDIT_STYLE_PRESETS,
   getEditStylePreset,
+  VIDEO_FILTER_PRESETS,
 } from "@/lib/video-effects";
 import {
   analyzeAudioFile,
@@ -65,6 +70,7 @@ import {
 import type {
   AspectMode,
   EditStyleId,
+  EditStylePacing,
   AudioAnalysis,
   BeatDensity,
   ClipArrangementMode,
@@ -77,6 +83,53 @@ import type {
   VideoCropRect,
   VideoFilterConfig,
 } from "@/types/renderer";
+
+type BatchQueueStatus = "queued" | "rendering" | "done" | "error";
+
+interface BatchQueueItem {
+  index: number;
+  hookText: string;
+  status: BatchQueueStatus;
+  error?: string;
+}
+
+interface VibeUndoSnapshot {
+  editStyle: EditStyleId | undefined;
+  videoFilter: VideoFilterConfig;
+  beatDensity: BeatDensity;
+  customCuts: number[] | null;
+}
+
+function pacingToBeatDensity(pacing: EditStylePacing): BeatDensity {
+  if (pacing === "every-beat") return "every-beat";
+  if (pacing === "every-2-beats" || pacing === "bar-boundary" || pacing === "single-take") {
+    return "every-2-beats";
+  }
+  return "balanced";
+}
+
+function pickAutoVibeStyleId(
+  audioAnalysis: AudioAnalysis | null,
+  clipCount: number,
+  currentStyle?: EditStyleId
+): EditStyleId {
+  let candidates: EditStyleId[];
+  if (audioAnalysis) {
+    if (audioAnalysis.bpm >= 125) {
+      candidates = ["fast-montage", "hyperpop-glitch", "kinetic-lyric"];
+    } else if (audioAnalysis.bpm >= 98) {
+      candidates =
+        clipCount >= 3
+          ? ["car-performance", "storytime-drop", "kinetic-lyric"]
+          : ["kinetic-lyric", "car-performance", "pov-vibe"];
+    } else {
+      candidates = ["pov-vibe", "vhs-lofi", "ghost-slowmo"];
+    }
+  } else {
+    candidates = ["pov-vibe", "fast-montage", "kinetic-lyric", "car-performance"];
+  }
+  return candidates.find((id) => id !== currentStyle) ?? candidates[0];
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -182,6 +235,9 @@ export function BeatSyncEditor() {
     useState<ClipArrangementMode>("shuffle-per-hook");
   const [autoDownloadEach, setAutoDownloadEach] = useState(false);
   const [showFineTune, setShowFineTune] = useState(false);
+  const [showAllVibes, setShowAllVibes] = useState(false);
+  const [vibeUndoSnapshot, setVibeUndoSnapshot] =
+    useState<VibeUndoSnapshot | null>(null);
 
   // Render State
   const [phase, setPhase] = useState<RenderPhase>("idle");
@@ -205,8 +261,60 @@ export function BeatSyncEditor() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   const [renderedClips, setRenderedClips] = useState<RenderedClip[]>([]);
+  const [batchQueue, setBatchQueue] = useState<BatchQueueItem[]>([]);
   const [previewClip, setPreviewClip] = useState<RenderedClip | null>(null);
   const [isZipping, setIsZipping] = useState(false);
+
+  const isRendering = phase === "loading-ffmpeg" || phase === "rendering";
+
+  useEffect(() => {
+    if (!isRendering) return;
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [isRendering]);
+
+  const applyVibePreset = useCallback(
+    (styleId: EditStyleId) => {
+      const preset = getEditStylePreset(styleId);
+      const matchedFilter = VIDEO_FILTER_PRESETS.find(
+        (f) => f.id === preset.filterPreset
+      );
+      const nextFilter = matchedFilter
+        ? { ...matchedFilter.config }
+        : { ...DEFAULT_VIDEO_FILTER };
+      const nextDensity = pacingToBeatDensity(preset.pacing);
+
+      setVibeUndoSnapshot({
+        editStyle,
+        videoFilter: { ...videoFilter },
+        beatDensity,
+        customCuts,
+      });
+      setEditStyle(styleId);
+      setVideoFilter(nextFilter);
+      setBeatDensity(nextDensity);
+      setCustomCuts(null);
+    },
+    [beatDensity, customCuts, editStyle, videoFilter]
+  );
+
+  const handleAutoVibe = useCallback(() => {
+    const pickedId = pickAutoVibeStyleId(audioAnalysis, clips.length, editStyle);
+    applyVibePreset(pickedId);
+  }, [applyVibePreset, audioAnalysis, clips.length, editStyle]);
+
+  const handleUndoVibe = useCallback(() => {
+    if (!vibeUndoSnapshot) return;
+    setEditStyle(vibeUndoSnapshot.editStyle);
+    setVideoFilter(vibeUndoSnapshot.videoFilter);
+    setBeatDensity(vibeUndoSnapshot.beatDensity);
+    setCustomCuts(vibeUndoSnapshot.customCuts);
+    setVibeUndoSnapshot(null);
+  }, [vibeUndoSnapshot]);
 
   const hooks = useMemo(
     () =>
@@ -300,6 +408,7 @@ export function BeatSyncEditor() {
       }
       return [];
     });
+    setBatchQueue([]);
     setPreviewClip(null);
   }, []);
 
@@ -502,20 +611,90 @@ export function BeatSyncEditor() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [previewClip]);
 
-  const handleStartBatch = async () => {
-    if (!audioAnalysis || clips.length === 0 || hooks.length === 0) return;
+  const encodeSingleReel = async ({
+    ffmpeg,
+    index,
+    hookText,
+    targetWidth,
+    targetHeight,
+    clipFileMap,
+    audioFileName,
+  }: {
+    ffmpeg: Awaited<ReturnType<typeof getFFmpeg>>;
+    index: number;
+    hookText: string;
+    targetWidth: number;
+    targetHeight: number;
+    clipFileMap: Awaited<ReturnType<typeof prepareBeatSyncAssets>>["clipFileMap"];
+    audioFileName: string;
+  }): Promise<RenderedClip> => {
+    if (!audioAnalysis) {
+      throw new Error("Audio analysis is required.");
+    }
+    const filename = slugifyHook(hookText, index);
+    const clipStart = performance.now();
+    const overlayPngBytes = await renderHookOverlayPng(
+      targetWidth,
+      targetHeight,
+      hookText,
+      styleConfig
+    );
 
-    cancelRequestedRef.current = false;
-    clearRenderedClips();
-    setErrorMessage(null);
-    setElapsedSeconds(0);
-    setCurrentClipIndex(0);
-    setCurrentClipProgress(0);
-    setPhase("loading-ffmpeg");
-    setEditStage("loading-ffmpeg");
-    setEditStepLabel("Initializing FFmpeg.wasm…");
-    setStatusMessage("Initializing local FFmpeg.wasm engine...");
+    let blob: Blob;
+    if (arrangementMode === "shared-edit") {
+      blob = await renderHookOnSyncedBase(
+        ffmpeg,
+        overlayPngBytes,
+        filename,
+        (ratio) => setCurrentClipProgress(ratio)
+      );
+    } else {
+      const seed = Date.now() + index * 7919;
+      const plan = buildBeatCutPlan(
+        activeCuts,
+        windowStart,
+        windowEnd,
+        clips,
+        seed,
+        {
+          editStyle: activeEditStylePreset,
+          drops: audioAnalysis.drops,
+        }
+      );
+      if (plan.length === 0) {
+        throw new Error("No valid beat segments in the selected window.");
+      }
+      blob = await renderSingleBeatSyncedReel({
+        ffmpeg,
+        segments: plan,
+        clips,
+        clipFileMap,
+        audioFileName,
+        windowStart,
+        windowEnd,
+        overlayPngBytes,
+        outputFilename: filename,
+        aspectMode,
+        videoFilter,
+        videoCrop,
+        onProgress: (ratio) => setCurrentClipProgress(ratio),
+      });
+    }
 
+    const url = URL.createObjectURL(blob);
+    return {
+      id: `bs-${index}-${Date.now()}`,
+      index,
+      hookText,
+      filename,
+      blob,
+      url,
+      sizeBytes: blob.size,
+      renderMs: Math.round(performance.now() - clipStart),
+    };
+  };
+
+  const getTargetDimensions = () => {
     const firstClip = clips[0];
     const targetWidth =
       aspectMode === "force-9x16"
@@ -525,6 +704,31 @@ export function BeatSyncEditor() {
       aspectMode === "force-9x16"
         ? 1920
         : Math.max(2, Math.floor(firstClip.height / 2) * 2);
+    return { targetWidth, targetHeight };
+  };
+
+  const handleStartBatch = async () => {
+    if (!audioAnalysis || clips.length === 0 || hooks.length === 0) return;
+
+    cancelRequestedRef.current = false;
+    clearRenderedClips();
+    setBatchQueue(
+      hooks.map((hookText, index) => ({
+        index,
+        hookText,
+        status: "queued",
+      }))
+    );
+    setErrorMessage(null);
+    setElapsedSeconds(0);
+    setCurrentClipIndex(0);
+    setCurrentClipProgress(0);
+    setPhase("loading-ffmpeg");
+    setEditStage("loading-ffmpeg");
+    setEditStepLabel("Initializing FFmpeg.wasm…");
+    setStatusMessage("Initializing local FFmpeg.wasm engine...");
+
+    const { targetWidth, targetHeight } = getTargetDimensions();
 
     try {
       await waitForIdlePreviewQueue();
@@ -593,106 +797,102 @@ export function BeatSyncEditor() {
         }
 
         setEditStage("rendering-reels");
+        let failedCount = 0;
+        let successCount = 0;
+
         for (let i = 0; i < hooks.length; i++) {
           if (cancelRequestedRef.current) {
             setPhase("cancelled");
             setEditStage("cancelled");
             setStatusMessage(
-              `Cancelled after rendering ${i} of ${hooks.length} Reels.`
+              `Cancelled after rendering ${successCount} of ${hooks.length} Reels.`
             );
             break;
           }
 
           const hookText = hooks[i];
-          const filename = slugifyHook(hookText, i);
           setCurrentClipIndex(i);
           setCurrentClipProgress(0);
+          setBatchQueue((prev) =>
+            prev.map((item) =>
+              item.index === i
+                ? { ...item, status: "rendering", error: undefined }
+                : item
+            )
+          );
           setEditStepLabel(`Reel ${i + 1} / ${hooks.length} encoding`);
           setStatusMessage(
             `Rendering Reel ${i + 1}/${hooks.length}: "${hookText.slice(0, 40)}${hookText.length > 40 ? "…" : ""}"`
           );
 
-          const clipStart = performance.now();
-          const overlayPngBytes = await renderHookOverlayPng(
-            targetWidth,
-            targetHeight,
-            hookText,
-            styleConfig
-          );
-
-          let blob: Blob;
-          if (arrangementMode === "shared-edit") {
-            blob = await renderHookOnSyncedBase(
+          try {
+            const rendered = await encodeSingleReel({
               ffmpeg,
-              overlayPngBytes,
-              filename,
-              (ratio) => setCurrentClipProgress(ratio)
-            );
-          } else {
-            const seed = Date.now() + i * 7919;
-            const plan = buildBeatCutPlan(
-              activeCuts,
-              windowStart,
-              windowEnd,
-              clips,
-              seed,
-              {
-                editStyle: activeEditStylePreset,
-                drops: audioAnalysis.drops,
-              }
-            );
-            if (plan.length === 0) {
-              throw new Error("No valid beat segments in the selected window.");
-            }
-            blob = await renderSingleBeatSyncedReel({
-              ffmpeg,
-              segments: plan,
-              clips,
+              index: i,
+              hookText,
+              targetWidth,
+              targetHeight,
               clipFileMap,
               audioFileName,
-              windowStart,
-              windowEnd,
-              overlayPngBytes,
-              outputFilename: filename,
-              aspectMode,
-              videoFilter,
-              videoCrop,
-              onProgress: (ratio) => setCurrentClipProgress(ratio),
             });
-          }
 
-          if (cancelRequestedRef.current) {
-            setPhase("cancelled");
-            setEditStage("cancelled");
-            setStatusMessage("Beat-sync render cancelled.");
-            break;
-          }
+            if (cancelRequestedRef.current) {
+              URL.revokeObjectURL(rendered.url);
+              setPhase("cancelled");
+              setEditStage("cancelled");
+              setStatusMessage("Beat-sync render cancelled.");
+              break;
+            }
 
-          const url = URL.createObjectURL(blob);
-          const rendered: RenderedClip = {
-            id: `bs-${i}-${Date.now()}`,
-            index: i,
-            hookText,
-            filename,
-            blob,
-            url,
-            sizeBytes: blob.size,
-            renderMs: Math.round(performance.now() - clipStart),
-          };
-
-          setRenderedClips((prev) => [...prev, rendered]);
-          if (autoDownloadEach) {
-            triggerDownload(url, filename);
+            successCount += 1;
+            setBatchQueue((prev) =>
+              prev.map((item) =>
+                item.index === i ? { ...item, status: "done" } : item
+              )
+            );
+            setRenderedClips((prev) => [...prev, rendered]);
+            if (autoDownloadEach) {
+              triggerDownload(rendered.url, rendered.filename);
+            }
+          } catch (itemErr) {
+            if (cancelRequestedRef.current) {
+              setPhase("cancelled");
+              setEditStage("cancelled");
+              setStatusMessage("Beat-sync render cancelled.");
+              break;
+            }
+            failedCount += 1;
+            const itemMessage = formatFFmpegError(itemErr);
+            setBatchQueue((prev) =>
+              prev.map((item) =>
+                item.index === i
+                  ? { ...item, status: "error", error: itemMessage }
+                  : item
+              )
+            );
           }
         }
 
         if (!cancelRequestedRef.current) {
-          setPhase("completed");
-          setEditStage("completed");
           setCurrentClipProgress(1);
-          setStatusMessage(
-            `Done! ${hooks.length} beat-synced Reel${hooks.length === 1 ? "" : "s"} ready to post.`
-          );
+          if (failedCount > 0 && successCount === 0) {
+            setPhase("error");
+            setEditStage("error");
+            setErrorMessage("All items failed to render. Retry individual items below.");
+            setStatusMessage("Render failed. Retry individual items below.");
+          } else if (failedCount > 0) {
+            setPhase("completed");
+            setEditStage("completed");
+            setStatusMessage(
+              `Done: ${successCount} ready, ${failedCount} failed — click Retry on failed items.`
+            );
+          } else {
+            setPhase("completed");
+            setEditStage("completed");
+            setStatusMessage(
+              `Done! ${hooks.length} beat-synced Reel${hooks.length === 1 ? "" : "s"} ready to post.`
+            );
+          }
         }
       } finally {
         await cleanupBeatSyncAssets(ffmpeg, clipFileMap, audioFileName);
@@ -712,6 +912,130 @@ export function BeatSyncEditor() {
       setEditStage("error");
       setErrorMessage(message);
       setStatusMessage("Render failed. Check the error message below.");
+    }
+  };
+
+  const handleRetryQueueItem = async (itemIndex: number) => {
+    if (isBusy || !audioAnalysis || clips.length === 0) return;
+    const targetItem = batchQueue.find((item) => item.index === itemIndex);
+    if (!targetItem) return;
+
+    cancelRequestedRef.current = false;
+    setErrorMessage(null);
+    setCurrentClipIndex(itemIndex);
+    setCurrentClipProgress(0);
+    setPhase("loading-ffmpeg");
+    setEditStage("loading-ffmpeg");
+    setEditStepLabel(`Retrying Reel #${itemIndex + 1}…`);
+    setStatusMessage(`Retrying Reel #${itemIndex + 1}…`);
+    setBatchQueue((prev) =>
+      prev.map((item) =>
+        item.index === itemIndex
+          ? { ...item, status: "rendering", error: undefined }
+          : item
+      )
+    );
+
+    const { targetWidth, targetHeight } = getTargetDimensions();
+
+    try {
+      await waitForIdlePreviewQueue();
+      const ffmpeg = await getFFmpeg();
+      setPhase("rendering");
+      setEditStage("loading-assets");
+      const { clipFileMap, audioFileName } = await prepareBeatSyncAssets(
+        ffmpeg,
+        clips,
+        audioAnalysis.file,
+        (done, total, name) => {
+          setCurrentClipProgress(done / total);
+          setEditStepLabel(`Loading ${name} (${done}/${total})`);
+        }
+      );
+
+      try {
+        if (arrangementMode === "shared-edit") {
+          const basePlan = buildBeatCutPlan(
+            activeCuts,
+            windowStart,
+            windowEnd,
+            clips,
+            undefined,
+            {
+              editStyle: activeEditStylePreset,
+              drops: audioAnalysis.drops,
+            }
+          );
+          if (basePlan.length === 0) {
+            throw new Error("No valid beat segments in the selected window.");
+          }
+          setEditStage("building-edit");
+          setCurrentClipProgress(0);
+          await buildBeatSyncedBaseVideo({
+            ffmpeg,
+            segments: basePlan,
+            clips,
+            clipFileMap,
+            audioFileName,
+            windowStart,
+            windowEnd,
+            aspectMode,
+            videoFilter,
+            videoCrop,
+            onProgress: (ratio) => setCurrentClipProgress(ratio),
+          });
+        }
+
+        setEditStage("rendering-reels");
+        setCurrentClipProgress(0);
+        setEditStepLabel(`Retrying Reel #${itemIndex + 1}`);
+        const rendered = await encodeSingleReel({
+          ffmpeg,
+          index: itemIndex,
+          hookText: targetItem.hookText,
+          targetWidth,
+          targetHeight,
+          clipFileMap,
+          audioFileName,
+        });
+
+        setBatchQueue((prev) =>
+          prev.map((item) =>
+            item.index === itemIndex ? { ...item, status: "done" } : item
+          )
+        );
+        setRenderedClips((prev) => {
+          const existing = prev.find((c) => c.index === itemIndex);
+          if (existing) URL.revokeObjectURL(existing.url);
+          return [...prev.filter((c) => c.index !== itemIndex), rendered].sort(
+            (a, b) => a.index - b.index
+          );
+        });
+        if (autoDownloadEach) {
+          triggerDownload(rendered.url, rendered.filename);
+        }
+        setPhase("completed");
+        setEditStage("completed");
+        setCurrentClipProgress(1);
+        setStatusMessage(`Reel #${itemIndex + 1} recovered and ready.`);
+      } finally {
+        await cleanupBeatSyncAssets(ffmpeg, clipFileMap, audioFileName);
+      }
+    } catch (err) {
+      if (!isFFmpegLoaded()) {
+        resetFFmpeg();
+      }
+      const message = formatFFmpegError(err);
+      setBatchQueue((prev) =>
+        prev.map((item) =>
+          item.index === itemIndex
+            ? { ...item, status: "error", error: message }
+            : item
+        )
+      );
+      setPhase("completed");
+      setEditStage("completed");
+      setErrorMessage(`Reel #${itemIndex + 1} retry failed: ${message}`);
     }
   };
 
@@ -1314,7 +1638,92 @@ export function BeatSyncEditor() {
               </button>
             </div>
 
-            {/* 1-Click Presets + Expandable Fine-Tune */}
+            {/* Tier-1 1-Click Vibe Presets + Auto-Vibe & Undo */}
+            <div className="mt-3.5 border-t border-white/10 pt-3.5">
+              <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="h-3.5 w-3.5 text-[#FF4D2E]" />
+                  <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-[#9A9DA8]">
+                    1-Click Vibe
+                  </span>
+                  {editStyle && (
+                    <span className="rounded-md bg-[#FF4D2E]/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#FF8A75]">
+                      {activeEditStylePreset.label}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {vibeUndoSnapshot && (
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={handleUndoVibe}
+                      className="nb-key inline-flex items-center gap-1 rounded-xl !border-amber-400/40 !bg-amber-400/10 px-2.5 py-1 font-mono text-[10px] font-semibold text-amber-200 hover:!border-amber-400/70"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      <span>Undo</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={handleAutoVibe}
+                    className="nb-key inline-flex items-center gap-1 rounded-xl !border-[#FF4D2E]/40 !bg-[#FF4D2E]/15 px-2.5 py-1 font-mono text-[10px] font-bold text-[#FF8A75] hover:!border-[#FF4D2E]"
+                    title="Pick a smart edit vibe, color grade & cut density for your song"
+                  >
+                    <Sparkles className="h-3 w-3" />
+                    <span>Auto-Vibe</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isBusy}
+                    onClick={() => setShowAllVibes((prev) => !prev)}
+                    className="nb-key inline-flex items-center gap-1 rounded-xl px-2.5 py-1 font-mono text-[10px] font-semibold text-[#C4C7D0]"
+                  >
+                    <span>
+                      {showAllVibes
+                        ? "Top 6"
+                        : `All ${EDIT_STYLE_PRESETS.length}`}
+                    </span>
+                    {showAllVibes ? (
+                      <ChevronUp className="h-3 w-3" />
+                    ) : (
+                      <ChevronDown className="h-3 w-3" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-1.5">
+                {(showAllVibes
+                  ? EDIT_STYLE_PRESETS
+                  : EDIT_STYLE_PRESETS.slice(0, 6)
+                ).map((preset) => {
+                  const active = editStyle === preset.id;
+                  return (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => applyVibePreset(preset.id)}
+                      title={preset.description}
+                      className={`nb-key inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-semibold ${
+                        active ? "nb-key-active" : ""
+                      }`}
+                    >
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full border border-white/25"
+                        style={{ background: preset.swatch }}
+                      />
+                      <span>{preset.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Text Presets + Expandable Fine-Tune */}
             <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-3.5">
               <div className="flex flex-wrap gap-1.5">
                 {TEXT_PRESETS.map((preset) => (
@@ -1703,11 +2112,77 @@ export function BeatSyncEditor() {
               </div>
             )}
 
+            {batchQueue.length > 0 && (
+              <div className="nb-well nb-scroll mb-3.5 max-h-44 space-y-1.5 overflow-y-auto rounded-2xl p-2.5">
+                {batchQueue.map((item) => (
+                  <div
+                    key={`${item.index}-${item.hookText.slice(0, 12)}`}
+                    className="flex items-center justify-between gap-2 rounded-xl border border-white/5 bg-[#121318]/80 px-2.5 py-1.5 text-[11px]"
+                  >
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="font-mono text-[10px] font-bold text-[#8B8F9C]">
+                        {String(item.index + 1).padStart(2, "0")}
+                      </span>
+                      <span className="truncate text-[#E5E7EB]">
+                        {item.hookText}
+                      </span>
+                    </div>
+
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      {item.status === "queued" && (
+                        <span className="rounded-md bg-white/5 px-2 py-0.5 font-mono text-[10px] font-semibold text-[#8B8F9C]">
+                          Queued
+                        </span>
+                      )}
+                      {item.status === "rendering" && (
+                        <span className="inline-flex items-center gap-1 rounded-md bg-[#FF4D2E]/15 px-2 py-0.5 font-mono text-[10px] font-semibold text-[#FF8A75]">
+                          <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                          Rendering
+                        </span>
+                      )}
+                      {item.status === "done" && (
+                        <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
+                          <CheckCircle2 className="h-2.5 w-2.5" />
+                          Done
+                        </span>
+                      )}
+                      {item.status === "error" && (
+                        <>
+                          <span
+                            title={item.error}
+                            className="inline-flex items-center gap-1 rounded-md bg-red-500/15 px-2 py-0.5 font-mono text-[10px] font-semibold text-red-300"
+                          >
+                            <AlertCircle className="h-2.5 w-2.5" />
+                            Failed
+                          </span>
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => handleRetryQueueItem(item.index)}
+                            className="nb-key inline-flex items-center gap-1 rounded-lg px-2 py-0.5 font-mono text-[10px] font-semibold text-[#F5F5F2] disabled:opacity-40"
+                          >
+                            <RotateCcw className="h-2.5 w-2.5" />
+                            Retry
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {errorMessage && (
               <div className="mb-3 rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-200">
                 {errorMessage}
               </div>
             )}
+
+            <p className="mb-2.5 text-center font-mono text-[11px] text-[#9A9DA8]">
+              {hooks.length} {hooks.length === 1 ? "reel" : "reels"} • ~
+              {Math.max(0, windowEnd - windowStart).toFixed(1)}s each •{" "}
+              {aspectMode === "force-9x16" ? "9:16" : "Original"}
+            </p>
 
             {!isBusy ? (
               <button

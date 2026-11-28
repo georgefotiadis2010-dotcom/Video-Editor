@@ -96,6 +96,21 @@ export function WaveformBeatEditor({
     };
   }, [analysis.url]);
 
+  // Pause waveform playback if another audio player (e.g. HookPreviewStage) starts
+  useEffect(() => {
+    const handleOtherAudioPlay = (e: Event) => {
+      const detail = (e as CustomEvent<{ source?: string }>).detail;
+      if (detail?.source !== "waveform") {
+        audioRef.current?.pause();
+        setIsPlaying(false);
+      }
+    };
+    window.addEventListener("lxg-audio-play", handleOtherAudioPlay);
+    return () => {
+      window.removeEventListener("lxg-audio-play", handleOtherAudioPlay);
+    };
+  }, []);
+
   // Animation loop for playhead while playing
   useEffect(() => {
     if (!isPlaying) return;
@@ -130,6 +145,9 @@ export function WaveformBeatEditor({
         audio.currentTime = windowStart;
         setPlayhead(windowStart);
       }
+      window.dispatchEvent(
+        new CustomEvent("lxg-audio-play", { detail: { source: "waveform" } })
+      );
       audio.play().catch(() => {});
       setIsPlaying(true);
     }
